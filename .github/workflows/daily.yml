@@ -1,0 +1,160 @@
+name: AlphaReversal Daily Signal
+
+"on":
+  # 北京时间 16:30（A股收盘后） = UTC 08:30，工作日
+  schedule:
+    - cron: '30 8 * * 1-5'
+  # 北京时间 18:00 跑周度 IC 检验 = UTC 10:00，每周五
+  # - cron: '0 10 * * 5'   # 取消注释启用周度 IC 检验
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  # ─────────────────────────────────────
+  # Job 1: 每日信号生成 + 飞书推送
+  # ─────────────────────────────────────
+  daily-signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install requests  # 飞书推送
+
+      - name: 🔧 配置初始化
+        run: |
+          # 如果仓库有 config_template.py，复制为 config.py
+          if [ -f config_template.py ]; then
+            cp config_template.py config.py
+            echo "✅ 已生成 config.py"
+          fi
+
+      - name: 🚀 运行当日策略
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  AlphaReversal 每日回测"
+          echo "  日期: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # 跑最近 70 天（覆盖 MA60 + 余量），但关注最后一天信号
+          START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
+          END=$(TZ='Asia/Shanghai' date +%Y%m%d)
+
+          echo "📅 数据区间: $START ~ $END"
+          echo ""
+
+          python run.py \
+            --pool top1500 \
+            --start $START \
+            --end $END \
+            --no-plot \
+            --execution next_open
+
+      - name: 📊 推送飞书（完整卡片）
+        if: env.FEISHU_WEBHOOK != ''
+        run: |
+          echo "📤 推送飞书..."
+          python feishu_notify.py --mode full --no-image
+
+      - name: 📤 上传结果存档
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ github.run_id }}
+          path: |
+            output/
+            results/
+          retention-days: 30
+
+      - name: 📋 打印摘要（即使推送失败也保留日志）
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  运行结束"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          # 显示 output 目录内容
+          ls -la output/ 2>/dev/null || echo "output/ 不存在"
+          # 显示 trades.csv 最后 5 行
+          if [ -f output/trades.csv ]; then
+            echo ""
+            echo "📄 最近交易记录:"
+            tail -5 output/trades.csv
+          fi
+
+  # ─────────────────────────────────────
+  # Job 2: 每周五跑因子 IC 检验（可选）
+  # ─────────────────────────────────────
+  weekly-ic-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event.schedule == '0 10 * * 5' || github.event_name == 'workflow_dispatch'
+    env:
+      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install requests
+
+      - name: 🔬 因子 IC 分析
+        run: |
+          echo "📅 数据区间: 2024-01-01 ~ 今日"
+          python tools/ic_quick.py 2>&1 | tee ic_report.txt || true
+
+      - name: 🎲 蒙特卡洛检验
+        run: |
+          python tools/monte_carlo.py 2>&1 | tee mc_report.txt || true
+
+      - name: 📤 上传 IC 报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: ic-mc-report-${{ github.run_id }}
+          path: |
+            ic_report.txt
+            mc_report.txt
+          retention-days: 90
+
+      - name: 📨 推送 IC 摘要到飞书
+        if: env.FEISHU_WEBHOOK != ''
+        run: |
+          IC_SUMMARY=$(head -30 ic_report.txt 2>/dev/null || echo "无 IC 数据")
+          python3 << 'PYEOF'
+          import os, requests
+          webhook = os.environ['FEISHU_WEBHOOK']
+          content = """🔬 AlphaReversal 周度因子检验报告
+
+          📅 $(date '+%Y-%m-%d')
+
+          📊 因子 IC 分析摘要:
+          $IC_SUMMARY
+
+          📌 健康标准: IC>0.02 & IR>0.2 为有效
+          ⚠️ 仅供研究学习，不构成投资建议"""
+          requests.post(webhook, json={'msg_type':'text','content':{'text':content}}, timeout=15)
+          print('✅ IC 报告已推送')
+          PYEOF
