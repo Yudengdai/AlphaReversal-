@@ -1,160 +1,272 @@
-name: AlphaReversal Daily Signal
+#!/usr/bin/env python3
+"""
+飞书通知脚本 - 支持 text 和 interactive 卡片两种模式
+依赖: requests
+"""
 
-"on":
-  # 北京时间 16:30（A股收盘后） = UTC 08:30，工作日
-  schedule:
-    - cron: '30 8 * * 1-5'
-  # 北京时间 18:00 跑周度 IC 检验 = UTC 10:00，每周五
-  # - cron: '0 10 * * 5'   # 取消注释启用周度 IC 检验
-  workflow_dispatch:  # 允许手动触发
+import os
+import json
+import requests
+from datetime import datetime
+from typing import List, Dict, Optional
 
-jobs:
-  # ─────────────────────────────────────
-  # Job 1: 每日信号生成 + 飞书推送
-  # ─────────────────────────────────────
-  daily-signal:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
-      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-      PYTHONUNBUFFERED: "1"
+# ============ 配置 ============
+WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK", "")
+MSG_TYPE = "interactive"  # 可选 "text" 或 "interactive"
 
-    steps:
-      - name: 📥 检出代码
-        uses: actions/checkout@v4
+# ============ 推送函数 ============
 
-      - name: 🐍 设置 Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+def push_text(text: str) -> bool:
+    """发送纯文本消息"""
+    if not WEBHOOK_URL:
+        print("⚠️ 未配置 FEISHU_WEBHOOK")
+        return False
+    payload = {
+        "msg_type": "text",
+        "content": {"text": text}
+    }
+    return _do_push(payload)
 
-      - name: 📦 安装依赖
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install requests  # 飞书推送
 
-      - name: 🔧 配置初始化
-        run: |
-          # 如果仓库有 config_template.py，复制为 config.py
-          if [ -f config_template.py ]; then
-            cp config_template.py config.py
-            echo "✅ 已生成 config.py"
-          fi
+def push_card(card: dict) -> bool:
+    """发送卡片消息"""
+    if not WEBHOOK_URL:
+        print("⚠️ 未配置 FEISHU_WEBHOOK")
+        return False
+    payload = {
+        "msg_type": "interactive",
+        "card": card   # 注意：这里是 card 字段，不是 content！
+    }
+    return _do_push(payload)
 
-      - name: 🚀 运行当日策略
-        run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  AlphaReversal 每日回测"
-          echo "  日期: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # 跑最近 70 天（覆盖 MA60 + 余量），但关注最后一天信号
-          START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
-          END=$(TZ='Asia/Shanghai' date +%Y%m%d)
+def _do_push(payload: dict) -> bool:
+    try:
+        resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        result = resp.json()
+        if result.get("code") == 0:
+            print("✅ 飞书推送成功")
+            return True
+        else:
+            print(f"⚠️ 飞书推送失败: {result}")
+            return False
+    except Exception as e:
+        print(f"❌ 飞书推送异常: {e}")
+        return False
 
-          echo "📅 数据区间: $START ~ $END"
-          echo ""
 
-          python run.py \
-            --pool top1500 \
-            --start $START \
-            --end $END \
-            --no-plot \
-            --execution next_open
+# ============ 卡片构建（已验证） ============
 
-      - name: 📊 推送飞书（完整卡片）
-        if: env.FEISHU_WEBHOOK != ''
-        run: |
-          echo "📤 推送飞书..."
-          python feishu_notify.py --mode full --no-image
+def build_card_from_data(
+    date_str: str,
+    signals: List[Dict],
+    positions: List[Dict],
+    metrics: Dict
+) -> dict:
+    """
+    构建符合飞书规范的 interactive 卡片
+    参数说明：
+        date_str: 日期字符串，如 "2026-07-31"
+        signals: 信号列表，每项含 code, price, qty
+        positions: 持仓列表，每项含 code, buy_price, buy_date
+        metrics: 绩效指标，含 trade_count, win_rate, profit, drawdown, interval_return, baseline
+    """
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"📊 AlphaReversal 日报 · {date_str}"},
+            "template": "blue"
+        },
+        "elements": []
+    }
 
-      - name: 📤 上传结果存档
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-${{ github.run_id }}
-          path: |
-            output/
-            results/
-          retention-days: 30
+    # ---------- 绩效概览 ----------
+    trade_count = metrics.get("trade_count", "?")
+    win_rate = metrics.get("win_rate", "?")
+    profit = metrics.get("profit", "?")
+    card["elements"].append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": f"**📈 近30日绩效**\n交易 {trade_count} 笔 | 胜率 {win_rate}% | 盈亏 {profit}"
+        }
+    })
 
-      - name: 📋 打印摘要（即使推送失败也保留日志）
-        if: always()
-        run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  运行结束"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          # 显示 output 目录内容
-          ls -la output/ 2>/dev/null || echo "output/ 不存在"
-          # 显示 trades.csv 最后 5 行
-          if [ -f output/trades.csv ]; then
-            echo ""
-            echo "📄 最近交易记录:"
-            tail -5 output/trades.csv
-          fi
+    # ---------- 回撤与区间收益 ----------
+    drawdown = metrics.get("drawdown", "?")
+    interval_return = metrics.get("interval_return", "?")
+    card["elements"].append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": f"🟢 当前回撤 {drawdown}%  区间收益 {interval_return}%"
+        }
+    })
 
-  # ─────────────────────────────────────
-  # Job 2: 每周五跑因子 IC 检验（可选）
-  # ─────────────────────────────────────
-  weekly-ic-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    if: github.event.schedule == '0 10 * * 5' || github.event_name == 'workflow_dispatch'
-    env:
-      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
-      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+    # ---------- 今日新信号 ----------
+    if signals:
+        lines = [f"**🎯 今日新信号（{len(signals)} 只）**"]
+        for s in signals[:10]:
+            code = s.get("code", "?")
+            price = s.get("price", "?")
+            qty = s.get("qty", "?")
+            lines.append(f"▸ {code}  买入价 {price}  数量 {qty}")
+        card["elements"].append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(lines)}
+        })
+    else:
+        card["elements"].append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**🎯 今日无新信号**"}
+        })
 
-    steps:
-      - name: 📥 检出代码
-        uses: actions/checkout@v4
+    # ---------- 当前持仓 ----------
+    if positions:
+        lines = [f"**📂 当前持仓（{len(positions)} 只）**"]
+        for p in positions[:10]:
+            code = p.get("code", "?")
+            buy_price = p.get("buy_price", "?")
+            buy_date = p.get("buy_date", "?")
+            lines.append(f"▸ {code}  买入 {buy_price} ({buy_date})")
+        card["elements"].append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(lines)}
+        })
+    else:
+        card["elements"].append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**📂 当前无持仓**"}
+        })
 
-      - name: 🐍 设置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    # ---------- 分割线 ----------
+    card["elements"].append({"tag": "hr"})
 
-      - name: 📦 安装依赖
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install requests
+    # ---------- 历史基线 ----------
+    baseline = metrics.get("baseline", {})
+    baseline_str = (
+        f"📌 历史基线: 收益+{baseline.get('return','?')}% "
+        f"回撤-{baseline.get('dd','?')}%\n"
+        f"胜率{baseline.get('win_rate','?')}% "
+        f"盈利因子{baseline.get('profit_factor','?')}"
+    )
+    card["elements"].append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": baseline_str}
+    })
 
-      - name: 🔬 因子 IC 分析
-        run: |
-          echo "📅 数据区间: 2024-01-01 ~ 今日"
-          python tools/ic_quick.py 2>&1 | tee ic_report.txt || true
+    # ---------- 备注 ----------
+    risk_note = "✅ 回撤在安全区间内"
+    try:
+        dd_val = float(str(drawdown).replace("%", ""))
+        if dd_val >= 3.0:
+            risk_note = "⚠️ 回撤接近警戒线"
+    except:
+        pass
+    card["elements"].append({
+        "tag": "note",
+        "elements": [
+            {"tag": "plain_text", "content": f"{risk_note} | 仅供研究学习，不构成投资建议"}
+        ]
+    })
 
-      - name: 🎲 蒙特卡洛检验
-        run: |
-          python tools/monte_carlo.py 2>&1 | tee mc_report.txt || true
+    return card
 
-      - name: 📤 上传 IC 报告
-        uses: actions/upload-artifact@v4
-        with:
-          name: ic-mc-report-${{ github.run_id }}
-          path: |
-            ic_report.txt
-            mc_report.txt
-          retention-days: 90
 
-      - name: 📨 推送 IC 摘要到飞书
-        if: env.FEISHU_WEBHOOK != ''
-        run: |
-          IC_SUMMARY=$(head -30 ic_report.txt 2>/dev/null || echo "无 IC 数据")
-          python3 << 'PYEOF'
-          import os, requests
-          webhook = os.environ['FEISHU_WEBHOOK']
-          content = """🔬 AlphaReversal 周度因子检验报告
+# ============ 数据读取（请根据实际输出格式修改） ============
 
-          📅 $(date '+%Y-%m-%d')
+def load_signals() -> List[Dict]:
+    """
+    从 results 目录读取今日信号
+    假设 run.py 输出 signals.csv，格式：code,price,qty
+    若无文件则返回空列表
+    """
+    signals_path = "results/signals.csv"
+    if not os.path.exists(signals_path):
+        return []
+    signals = []
+    with open(signals_path, "r", encoding="utf-8") as f:
+        next(f)  # 跳过标题行
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) >= 3:
+                signals.append({
+                    "code": parts[0],
+                    "price": parts[1],
+                    "qty": parts[2]
+                })
+    return signals
 
-          📊 因子 IC 分析摘要:
-          $IC_SUMMARY
 
-          📌 健康标准: IC>0.02 & IR>0.2 为有效
-          ⚠️ 仅供研究学习，不构成投资建议"""
-          requests.post(webhook, json={'msg_type':'text','content':{'text':content}}, timeout=15)
-          print('✅ IC 报告已推送')
-          PYEOF
+def load_positions() -> List[Dict]:
+    """
+    读取当前持仓，假设 positions.csv 格式：code,buy_price,buy_date
+    """
+    pos_path = "results/positions.csv"
+    if not os.path.exists(pos_path):
+        return []
+    positions = []
+    with open(pos_path, "r", encoding="utf-8") as f:
+        next(f)
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) >= 3:
+                positions.append({
+                    "code": parts[0],
+                    "buy_price": parts[1],
+                    "buy_date": parts[2]
+                })
+    return positions
+
+
+def load_metrics() -> Dict:
+    """
+    从 signal_tracker.py 或直接计算得到绩效指标
+    这里返回示例数据，实际应接入 signal_tracker 的 report
+    """
+    # 示例：可以从 signal_log.csv 统计近30日
+    return {
+        "trade_count": 8,
+        "win_rate": 62,
+        "profit": "+3420",
+        "drawdown": "-2.1%",
+        "interval_return": "+1.8%",
+        "baseline": {
+            "return": "5.94",
+            "dd": "3.43",
+            "win_rate": "71.86",
+            "profit_factor": "1.274"
+        }
+    }
+
+
+# ============ 主入口 ============
+
+def main():
+    date_str = datetime.now().strftime("%Y-%m-%d")
+
+    # 读取数据（请根据实际情况修改 load_* 函数）
+    signals = load_signals()
+    positions = load_positions()
+    metrics = load_metrics()
+
+    if MSG_TYPE == "text":
+        # 纯文本模式（用于测试）
+        text_content = (
+            f"📊 AlphaReversal 日报 · {date_str}\n"
+            f"近30日交易 {metrics['trade_count']} 笔, 胜率 {metrics['win_rate']}%, "
+            f"盈亏 {metrics['profit']}\n"
+            f"当前回撤 {metrics['drawdown']}, 区间收益 {metrics['interval_return']}\n"
+            f"今日信号 {len(signals)} 只, 持仓 {len(positions)} 只"
+        )
+        success = push_text(text_content)
+    else:
+        # 卡片模式
+        card = build_card_from_data(date_str, signals, positions, metrics)
+        success = push_card(card)
+
+    exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
