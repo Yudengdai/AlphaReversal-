@@ -1,14 +1,18 @@
 name: AlphaReversal Daily Signal
 
 "on":
+  # 北京时间 16:30（A股收盘后） = UTC 08:30，工作日
   schedule:
-    - cron: '30 8 * * 1-5'   # 工作日 16:30 北京
-  workflow_dispatch:
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:  # 允许手动触发
 
 env:
   FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
 
 jobs:
+  # ─────────────────────────────────────
+  # Job 1: 每日信号生成 + 飞书推送
+  # ─────────────────────────────────────
   daily-signal:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -38,36 +42,27 @@ jobs:
             echo "✅ 已生成 config.py"
           fi
 
-      # ────────────── 关键修改：无 Token 时使用示例数据 ──────────────
-      - name: 🚀 运行策略（有 Token 则真实运行，否则模拟）
-        id: run_strategy
+      - name: 🚀 运行策略（有 Token 真实运行，无 Token 模拟数据）
         run: |
           if [ -z "$TUSHARE_TOKEN" ]; then
             echo "⚠️ TUSHARE_TOKEN 未设置，使用示例数据模拟"
-            mkdir -p output results
+            mkdir -p results
 
-            # 创建模拟信号文件（用 echo 逐行写入，避免 heredoc 缩进问题）
             echo "code,price,qty" > results/signals.csv
             echo "600519.SH,1680.50,5" >> results/signals.csv
             echo "300750.SZ,245.30,40" >> results/signals.csv
             echo "002594.SZ,89.20,110" >> results/signals.csv
 
-            # 创建模拟持仓文件
             echo "code,buy_price,buy_date" > results/positions.csv
             echo "600036.SH,38.50,2026-07-28" >> results/positions.csv
             echo "000858.SZ,142.80,2026-07-21" >> results/positions.csv
-
-            # 创建模拟交易记录
-            echo "date,code,type,price,qty,pnl" > output/trades.csv
-            echo "2026-07-31,600519.SH,buy,1680.50,5,0" >> output/trades.csv
-            echo "2026-07-30,300750.SZ,sell,248.00,40,+108" >> output/trades.csv
-            echo "2026-07-29,002594.SZ,buy,89.20,110,0" >> output/trades.csv
 
             echo "✅ 示例数据已生成"
           else
             echo "🚀 TUSHARE_TOKEN 已设置，开始真实回测"
             START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
             END=$(TZ='Asia/Shanghai' date +%Y%m%d)
+            echo "📅 数据区间: $START ~ $END"
             python run.py \
               --pool top1500 \
               --start $START \
@@ -76,11 +71,11 @@ jobs:
               --execution next_open
           fi
 
-      - name: 📊 推送飞书（完整卡片）
+      - name: 📊 推送飞书
         if: env.FEISHU_WEBHOOK != ''
         run: |
           echo "📤 推送飞书..."
-          python feishu_notify.py --mode full --no-image
+          python feishu_notify.py
 
       - name: 📤 上传结果存档
         if: always()
@@ -98,9 +93,5 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  运行结束"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          ls -la results/ 2>/dev/null || echo "results/ 不存在"
           ls -la output/ 2>/dev/null || echo "output/ 不存在"
-          if [ -f output/trades.csv ]; then
-            echo ""
-            echo "📄 最近交易记录:"
-            tail -5 output/trades.csv
-          fi
