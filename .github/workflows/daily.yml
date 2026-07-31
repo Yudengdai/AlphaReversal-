@@ -46,28 +46,22 @@ jobs:
             echo "⚠️ TUSHARE_TOKEN 未设置，使用示例数据模拟"
             mkdir -p output results
 
-            # 创建模拟信号文件（格式：code,price,qty）
-            cat > results/signals.csv << EOF
-            code,price,qty
-            600519.SH,1680.50,5
-            300750.SZ,245.30,40
-            002594.SZ,89.20,110
-            EOF
+            # 创建模拟信号文件（用 echo 逐行写入，避免 heredoc 缩进问题）
+            echo "code,price,qty" > results/signals.csv
+            echo "600519.SH,1680.50,5" >> results/signals.csv
+            echo "300750.SZ,245.30,40" >> results/signals.csv
+            echo "002594.SZ,89.20,110" >> results/signals.csv
 
-            # 创建模拟持仓文件（格式：code,buy_price,buy_date）
-            cat > results/positions.csv << EOF
-            code,buy_price,buy_date
-            600036.SH,38.50,2026-07-28
-            000858.SZ,142.80,2026-07-21
-            EOF
+            # 创建模拟持仓文件
+            echo "code,buy_price,buy_date" > results/positions.csv
+            echo "600036.SH,38.50,2026-07-28" >> results/positions.csv
+            echo "000858.SZ,142.80,2026-07-21" >> results/positions.csv
 
-            # 创建模拟交易记录（用于 signal_tracker 统计）
-            cat > output/trades.csv << EOF
-            date,code,type,price,qty,pnl
-            2026-07-31,600519.SH,buy,1680.50,5,0
-            2026-07-30,300750.SZ,sell,248.00,40,+108
-            2026-07-29,002594.SZ,buy,89.20,110,0
-            EOF
+            # 创建模拟交易记录
+            echo "date,code,type,price,qty,pnl" > output/trades.csv
+            echo "2026-07-31,600519.SH,buy,1680.50,5,0" >> output/trades.csv
+            echo "2026-07-30,300750.SZ,sell,248.00,40,+108" >> output/trades.csv
+            echo "2026-07-29,002594.SZ,buy,89.20,110,0" >> output/trades.csv
 
             echo "✅ 示例数据已生成"
           else
