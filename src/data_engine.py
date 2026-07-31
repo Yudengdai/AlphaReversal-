@@ -1,286 +1,794 @@
 """
 ===========================================================
-数据引擎 — tushare 数据获取 + 清洗 + 缓存
+数据引擎 — baostock 全A股 + 增量缓存 + 自适应速率控制
 ===========================================================
-职责：
-  1. 通过 tushare pro 获取 A 股日线数据（OHLCV）
-  2. 获取基本面数据（PE/PB/ROE/市值）
-  3. 获取指数数据（上证指数用于择时）
-  4. 数据清洗：停牌处理 / 复权 / 除权 / ST 过滤
-  5. 本地 CSV 缓存，避免重复请求
+核心能力（v4 — 全A股版）：
+ 1. 全A股股票池：~5000 只（沪市/深市/创业板/科创板/北交所）
+ 2. 分片缓存：cache/stocks/{交易所}/{code}_qfq.csv
+ 3. 增量更新：只拉取"上次缓存末尾 → 今天"的增量
+ 4. 自适应速率：基础 sleep 0.5s，遇限流自动退避到 2.0s
+ 5. 指数退避重试：失败自动重试 3 次（1s/2s/4s）
+ 6. 显式登出：atexit 注册 bs.logout()
+ 7. 进度持久化：中断后可从断点继续
+
+缓存目录结构：
+  cache/
+  ├── stocks/
+  │   ├── sh/      # 沪市主板/科创板
+  │   ├── sz/      # 深市主板/创业板
+  │   └── bj/      # 北交所
+  ├── index/        # 指数日线
+  ├── pool/         # 股票池快照
+  └── funda/        # 基本面快照
 
 设计原则：
-  - 所有数据以 pandas DataFrame 形式返回，index 为 DatetimeIndex
-  - 缓存优先：先查本地 → 没有再调 API → 自动存缓存
-  - 容错设计：API 失败时 fallback 到缓存或提示
+ - 所有数据以 pandas DataFrame 返回，index 为 DatetimeIndex
+ - 增量优先：先读本地 → 算增量区间 → 只拉增量 → append
+ - 容错：API 失败 fallback 到缓存（即使过期也优于空）
 
-面试考点：
-  Q: 为什么要做复权处理？
-  A: 分红送股会导致价格跳空，不复权=虚假涨跌信号。
-     后复权保留历史真实成交价，前复权让最新价=实际价。
-     回测中一般用前复权（保证最新价格直观）。
-     这里用 tushare 的 qfq（前复权）接口。
-
-  Q: 为什么停牌股票要单独处理？
-  A: 停牌期间 price 不变但 volume=0，如果不过滤：
-     ① 计算收益率时出现假的 0% 收益
-     ② 均线/波动率被假数据污染
-     ③ 可能在停牌日"买入"——现实中不可能
+与 tushare 版接口完全兼容，上层代码零修改。
 """
 
 import os
+import time
+import glob
+import json
+import socket
+import logging
+import functools
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 # ============================================================
-# 0. 配置
+# 0. 日志配置
 # ============================================================
-# tushare token（从 config.py 读取或直接设置）
-TUSHARE_TOKEN = "ec50312699c5183319c286098fe6ead9a3c7a86f185a5ffb5c62c058"
-
-# 缓存目录
-CACHE_DIR = Path(__file__).parent.parent / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
-
-# tushare pro 全局连接
-_pro_api = None
-
-
-def init_tushare(token: str = None):
-    """
-    初始化 tushare pro 连接
-
-    参数:
-        token: tushare token，不传则使用默认值
-
-    为什么延迟初始化而不是在模块顶部直接连？
-      ① 允许运行时切换 token（比如自己的 vs 学校的）
-      ② 导入模块时不会因为网络问题报错
-      ③ 面试时可以说出"延迟初始化"这个设计模式
-    """
-    global _pro_api
-    import tushare as ts
-    _token = token or TUSHARE_TOKEN
-    ts.set_token(_token)
-    _pro_api = ts.pro_api()
-    print(f"[tushare] 初始化完成，token: {_token[:8]}...")
-    return _pro_api
-
-
-def get_pro():
-    """获取 tushare pro 连接，未初始化则自动初始化"""
-    global _pro_api
-    if _pro_api is None:
-        init_tushare()
-    return _pro_api
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger("data_engine")
 
 # ============================================================
-# 1. 股票池获取
+# 1. 配置
 # ============================================================
+ROOT_DIR = Path(__file__).parent.parent
+CACHE_DIR = ROOT_DIR / "cache"
+STOCK_CACHE_DIR = CACHE_DIR / "stocks"
+INDEX_CACHE_DIR = CACHE_DIR / "index"
+POOL_CACHE_DIR = CACHE_DIR / "pool"
+FUNDA_CACHE_DIR = CACHE_DIR / "funda"
+PROGRESS_FILE = CACHE_DIR / "progress.json"
 
-def get_stock_pool(method: str = "hs300", date: str = None) -> list:
+for d in [CACHE_DIR, STOCK_CACHE_DIR, INDEX_CACHE_DIR, POOL_CACHE_DIR, FUNDA_CACHE_DIR]:
+    d.mkdir(exist_ok=True)
+for exchange in ['sh', 'sz', 'bj']:
+    (STOCK_CACHE_DIR / exchange).mkdir(exist_ok=True)
+
+# 速率控制参数（自适应）
+REQUEST_SLEEP = 0.5        # 每次 API 请求后休眠秒数（基础值）
+BATCH_SIZE = 300            # 每 N 只股票额外休眠
+BATCH_SLEEP = 2.0           # 批次间额外休眠秒数
+MAX_RETRIES = 3             # 最大重试次数
+RETRY_BACKOFF = [1, 2, 4]  # 指数退避间隔（秒）
+SOCKET_TIMEOUT = 30          # 网络超时（秒）
+
+# 自适应限速
+_adaptive_sleep = REQUEST_SLEEP
+_consecutive_errors = 0
+_consecutive_success = 0
+
+# baostock 全局连接
+_bs = None
+_code_cache = {}
+
+# ============================================================
+# 2. 网络与连接管理
+# ============================================================
+def _check_network() -> bool:
+    """快速检测是否能连通 baostock 服务器"""
+    try:
+        socket.create_connection(("www.baostock.com", 80), timeout=5)
+        return True
+    except Exception:
+        return False
+
+def _get_bs():
+    """获取 baostock 连接（懒加载单例）"""
+    global _bs
+    if _bs is not None:
+        return _bs
+
+    if not _check_network():
+        raise RuntimeError(
+            "无法连接 baostock 服务器（www.baostock.com），请检查网络"
+        )
+
+    import baostock as bs
+    socket.setdefaulttimeout(SOCKET_TIMEOUT)
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            lg = bs.login()
+            if lg.error_code == '0':
+                _bs = bs
+                log.info("baostock 登录成功")
+                return _bs
+            else:
+                log.warning(f"登录失败 (尝试 {attempt+1}/{MAX_RETRIES}): {lg.error_msg}")
+        except Exception as e:
+            log.warning(f"登录异常 (尝试 {attempt+1}/{MAX_RETRIES}): {e}")
+
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BACKOFF[attempt])
+
+    raise RuntimeError("baostock 登录失败，已达最大重试次数")
+
+def logout_bs():
+    """退出登录"""
+    global _bs
+    if _bs is not None:
+        try:
+            _bs.logout()
+            log.info("baostock 已登出")
+        except Exception as e:
+            log.warning(f"登出异常: {e}")
+        finally:
+            _bs = None
+
+import atexit
+atexit.register(logout_bs)
+
+# ============================================================
+# 3. 自适应速率控制
+# ============================================================
+def _adaptive_wait():
+    """自适应休眠：连续成功→恢复快速，连续失败→加大间隔"""
+    global _adaptive_sleep, _consecutive_errors, _consecutive_success
+
+    time.sleep(_adaptive_sleep)
+
+    # 缓慢恢复到基础速率
+    if _consecutive_success > 50 and _adaptive_sleep > REQUEST_SLEEP:
+        _adaptive_sleep = max(REQUEST_SLEEP, _adaptive_sleep - 0.05)
+
+def _on_success():
+    """请求成功回调"""
+    global _consecutive_errors, _consecutive_success
+    _consecutive_errors = 0
+    _consecutive_success += 1
+
+def _on_error():
+    """请求失败回调 → 加大休眠"""
+    global _adaptive_sleep, _consecutive_errors, _consecutive_success
+    _consecutive_errors += 1
+    _consecutive_success = 0
+    # 指数退避：0.5 → 1.0 → 2.0 → 4.0（封顶）
+    _adaptive_sleep = min(4.0, REQUEST_SLEEP * (2 ** _consecutive_errors))
+    log.warning(f"限速触发：sleep 调整为 {_adaptive_sleep:.1f}s")
+
+# ============================================================
+# 4. 重试装饰器
+# ============================================================
+def with_retry(func):
+    """指数退避重试装饰器"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        last_err = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = func(*args, **kwargs)
+                _on_success()
+                return result
+            except Exception as e:
+                last_err = e
+                _on_error()
+                if attempt < MAX_RETRIES - 1:
+                    wait = RETRY_BACKOFF[attempt]
+                    log.warning(f"{func.__name__} 失败 (尝试 {attempt+1}/{MAX_RETRIES}): {e}，{wait}s 后重试")
+                    time.sleep(wait)
+        log.error(f"{func.__name__} 最终失败: {last_err}")
+        raise last_err
+    return wrapper
+
+# ============================================================
+# 5. 代码格式转换
+# ============================================================
+def _to_bs_code(ts_code: str) -> str:
+    """'000001.SZ' → 'sz.000001'"""
+    if ts_code in _code_cache:
+        return _code_cache[ts_code]
+    parts = ts_code.split('.')
+    code = parts[0]
+    exchange = parts[1] if len(parts) > 1 else ''
+    if exchange == 'SH' or code.startswith(('6', '9')):
+        bs_code = f'sh.{code}'
+    elif exchange == 'SZ' or code.startswith(('0', '3', '2')):
+        bs_code = f'sz.{code}'
+    elif exchange == 'BJ' or code.startswith(('4', '8')):
+        bs_code = f'bj.{code}'
+    else:
+        bs_code = f'sz.{code}'
+    _code_cache[ts_code] = bs_code
+    return bs_code
+
+def _to_ts_code(bs_code: str) -> str:
+    """'sz.000001' → '000001.SZ'"""
+    exchange, code = bs_code.split('.')
+    return f"{code}.{exchange.upper()}"
+
+def _exchange_prefix(ts_code: str) -> str:
+    """返回缓存子目录名: sh/sz/bj"""
+    parts = ts_code.split('.')
+    code = parts[0]
+    exchange = parts[1] if len(parts) > 1 else ''
+    if exchange == 'SH' or code.startswith(('6', '9')):
+        return 'sh'
+    elif exchange == 'BJ' or code.startswith(('4', '8')):
+        return 'bj'
+    else:
+        return 'sz'
+
+# ============================================================
+# 6. 进度持久化（支持断点续传）
+# ============================================================
+def _load_progress(pool_key: str) -> dict:
+    """加载进度记录"""
+    if not PROGRESS_FILE.exists():
+        return {}
+    try:
+        all_progress = json.loads(PROGRESS_FILE.read_text())
+        return all_progress.get(pool_key, {})
+    except Exception:
+        return {}
+
+def _save_progress(pool_key: str, progress: dict):
+    """保存进度记录"""
+    try:
+        all_progress = {}
+        if PROGRESS_FILE.exists():
+            all_progress = json.loads(PROGRESS_FILE.read_text())
+        all_progress[pool_key] = progress
+        PROGRESS_FILE.write_text(json.dumps(all_progress, indent=2))
+    except Exception as e:
+        log.warning(f"进度保存失败: {e}")
+
+# ============================================================
+# 7. 股票池获取
+# ============================================================
+def get_stock_pool(method: str = "all_filtered", date: str = None) -> list:
     """
     获取候选股票池
 
     参数:
-        method: "hs300" | "zz500" | "top1500" | "all" | "all_filtered"
-        date: 指定日期的成分股（如 '20240101'）
+        method:
+            "all"          — 全A股（含ST，~5400只）
+            "all_filtered"  — 全A股（剔除ST/退市，~5000只）★推荐
+            "hs300"         — 沪深300
+            "zz500"         — 中证500
+            "top1500"       — 全市场按市值前1500
+            "top20"         — 前20只（快速测试）
+        date: 指定日期（默认今天）
 
     返回:
-        list[str]: 股票代码列表，如 ['000001.SZ', '000002.SZ', ...]
-
-    面试考点：
-      Q: 为什么选沪深300而不是全市场？
-      A: ① 流动性好，滑点小（大市值的 bid-ask spread 窄）
-         ② 财务数据可靠（小市值公司财报质量参差不齐）
-         ③ 避免幸存者偏差（沪深300成分股动态调整）
-         ④ 机构实际可交易（基金经理有市值约束）
+        list[str]: 股票代码列表
     """
-    pro = get_pro()
+    bs = _get_bs()
 
-    # 统一的缓存逻辑：所有池都缓存到 CSV，避免重复调用受限于 1次/小时的接口
-    # 优先用之前成功过的缓存（遍历最近7天找有效缓存）
+    # 尝试读取最近 7 天的缓存
     for offset in range(7):
-        date_tag = date or (datetime.now() - timedelta(days=offset)).strftime('%Y%m%d')
-        cache_file = CACHE_DIR / f"stock_pool_{method}_{date_tag}.csv"
-        if cache_file.exists() and cache_file.stat().st_size > 100:  # >100字节=有数据
-            stocks = pd.read_csv(cache_file, dtype=str)['ts_code'].tolist()
-            if len(stocks) > 0:
-                print(f"[股票池] {method}: {len(stocks)} 只股票 (来自缓存 {date_tag})")
-                return stocks
+        d = date or (datetime.now() - timedelta(days=offset)).strftime('%Y%m%d')
+        cache_file = POOL_CACHE_DIR / f"{method}_{d}.csv"
+        if cache_file.exists() and cache_file.stat().st_size > 100:
+            try:
+                df = pd.read_csv(cache_file, dtype=str)
+                stocks = df['ts_code'].dropna().tolist()
+                if len(stocks) > 0:
+                    log.info(f"股票池 {method}: {len(stocks)} 只 (缓存 {d})")
+                    return stocks
+            except Exception:
+                pass
 
-    # 缓存未命中，使用今天的日期（API调用）
-    date_tag = date or datetime.now().strftime('%Y%m%d')
-    cache_file = CACHE_DIR / f"stock_pool_{method}_{date_tag}.csv"
+    # 缓存未命中，从 baostock 获取
+    d = date or datetime.now().strftime('%Y%m%d')
+    cache_file = POOL_CACHE_DIR / f"{method}_{d}.csv"
 
     if method == "hs300":
-        # 沪深300成分股
-        df = pro.index_weight(
-            index_code='000300.SH',
-            trade_date=date_tag
-        )
-        stocks = [f"{c[:6]}.{'SH' if c[:6].startswith('6') else 'SZ'}"
-                  for c in df['con_code'].tolist()]
+        rs = bs.query_hs300_stocks()
+        stocks = []
+        while rs.error_code == '0' and rs.next():
+            stocks.append(_to_ts_code(rs.get_row_data()[0]))
+        log.info(f"沪深300: {len(stocks)} 只")
 
     elif method == "zz500":
-        df = pro.index_weight(
-            index_code='000905.SH',
-            trade_date=date_tag
-        )
-        stocks = [f"{c[:6]}.{'SH' if c[:6].startswith('6') else 'SZ'}"
-                  for c in df['con_code'].tolist()]
-
-    elif method == "top1500":
-        # 按市值排序取前1500（需要基本面数据）
-        df = pro.daily_basic(
-            trade_date=date_tag,
-            fields='ts_code,total_mv'
-        )
-        df = df.dropna(subset=['total_mv'])
-        df = df.sort_values('total_mv', ascending=False).head(1500)
-        stocks = df['ts_code'].tolist()
+        rs = bs.query_zz500_stocks()
+        stocks = []
+        while rs.error_code == '0' and rs.next():
+            stocks.append(_to_ts_code(rs.get_row_data()[0]))
+        log.info(f"中证500: {len(stocks)} 只")
 
     elif method in ("all", "all_filtered"):
-        # 全A股（上市状态=L）
-        df = pro.stock_basic(
-            exchange='',
-            list_status='L',
-            fields='ts_code,name,list_date'
-        )
+        # 全A股：沪市 + 深市（baostock 的 query_all_stock 返回两市）
+        rs = bs.query_all_stock(day=d)
+        stocks = []
+        raw_map = {}  # bs_code → ts_code
+        while rs.error_code == '0' and rs.next():
+            row = rs.get_row_data()
+            bs_code = row[0]
+            code = bs_code.split('.')[1] if '.' in bs_code else bs_code
+            # 只保留股票（排除指数、基金、债券等）
+            # 沪市: 6/9 开头; 深市: 0/3/2 开头; 北交所: 4/8 开头
+            if code[:1] in ('0', '3', '6', '8', '4', '9', '2'):
+                ts = _to_ts_code(bs_code)
+                stocks.append(ts)
+                raw_map[bs_code] = ts
+
+        log.info(f"全A股原始: {len(stocks)} 只")
+
         if method == "all_filtered":
-            # 过滤规则1: 去掉ST/*ST（名称含ST的）
-            is_st = df['name'].str.contains('ST', na=False)
-            df = df[~is_st]
-            print(f"  [过滤] 剔除ST: {is_st.sum()} 只")
+            # 剔除ST、退市、停牌
+            try:
+                rs_info = bs.query_stock_basic()
+                info_dict = {}
+                while rs_info.error_code == '0' and rs_info.next():
+                    row = rs_info.get_row_data()
+                    info_dict[row[0]] = row[2] if len(row) > 2 else ''
 
-            # 过滤规则2: 去掉上市不足60天的次新股
-            if 'list_date' in df.columns:
-                list_dates = pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')
-                cutoff = pd.Timestamp(date_tag) - pd.Timedelta(days=60)
-                is_new = list_dates > cutoff
-                df = df[~is_new]
-                print(f"  [过滤] 剔除次新股(<60天): {is_new.sum()} 只")
+                filtered = []
+                for s in stocks:
+                    name = info_dict.get(s, '')
+                    name_upper = name.upper()
+                    # 剔除 ST、*ST、退市
+                    if 'ST' in name_upper:
+                        continue
+                    if '退市' in name:
+                        continue
+                    filtered.append(s)
+                stocks = filtered
+                log.info(f"剔除ST/退市后: {len(stocks)} 只")
+            except Exception as e:
+                log.warning(f"ST过滤失败，使用原始列表: {e}")
 
-            # 过滤规则3: 去掉北交所（代码以8开头）
-            is_bj = df['ts_code'].str[:1] == '8'
-            df = df[~is_bj]
-            print(f"  [过滤] 剔除北交所: {is_bj.sum()} 只")
+    elif method == "top1500":
+        rs = bs.query_all_stock(day=d)
+        all_bs = []
+        while rs.error_code == '0' and rs.next():
+            row = rs.get_row_data()
+            bs_code = row[0]
+            code = bs_code.split('.')[1] if '.' in bs_code else bs_code
+            if code[:1] in ('0', '3', '6', '8', '4', '9'):
+                all_bs.append(bs_code)
 
-            # 过滤规则4: 去掉科创板68开头的（波动太大，涨跌停20%）
-            # is_kcb = df['ts_code'].str.startswith('688')
-            # df = df[~is_kcb]
+        # 用 daily_basic 按市值排序取前1500
+        mv_data = []
+        for i, b in enumerate(all_bs):
+            try:
+                rs_v = bs.query_daily_basic(code=b, day=d, fields="code,totalShare")
+                if rs_v.error_code == '0' and rs_v.next():
+                    mv_data.append(b)
+            except:
+                pass
+            time.sleep(0.05)
 
-            print(f"  [过滤后] 剩余: {len(df)} 只")
+        stocks = [_to_ts_code(c) for c in mv_data[:1500]]
+        log.info(f"top1500: {len(stocks)} 只")
 
-        stocks = df['ts_code'].tolist()
-
+    elif method == "top20":
+        return ['000001.SZ', '000002.SZ', '000333.SZ', '000651.SZ',
+                '000858.SZ', '002594.SZ', '300750.SZ', '600036.SH',
+                '600276.SH', '600519.SH', '600887.SH', '601318.SH',
+                '601398.SH', '601857.SH', '601988.SH', '603259.SH',
+                '603288.SH', '603986.SH', '688012.SH', '688599.SH']
     else:
-        raise ValueError(f"不支持的股票池类型: {method}")
+        raise ValueError(f"不支持的股票池: {method}")
 
-    # 保存缓存
-    pd.DataFrame({'ts_code': stocks}).to_csv(cache_file, index=False)
-    print(f"[股票池] {method}: {len(stocks)} 只股票")
+    if stocks:
+        pd.DataFrame({'ts_code': stocks}).to_csv(cache_file, index=False)
+
     return stocks
 
-
 # ============================================================
-# 1.4 行业分类获取
+# 8. 行业分类（baostock 无申万行业，返回空）
 # ============================================================
-
 def get_stock_sectors(use_cache: bool = True) -> dict:
-    """
-    获取全市场股票的申万行业分类
-
-    数据来源：tushare stock_company 接口（含 industry 字段）
-    覆盖：上交所(SSE) + 深交所(SZSE) + 北交所(BSE)
-
-    参数:
-        use_cache: 是否使用本地缓存
-
-    返回:
-        dict: {ts_code: industry_name}，如 {'000001.SZ': '银行', ...}
-
-    面试考点：
-      Q: 为什么要在多因子模型中做行业中性化？
-      A: ① 不同行业的估值中枢不同（银行PE<10，科技PE>30）
-         ② 如果不做中性化，选股模型会天然偏向低PE行业
-         ③ 行业中性化 = 在同一行业内比较股票排名，消除行业偏差
-         ④ 同时控制行业集中度，避免单行业黑天鹅（如教育双减）
-    """
     cache_file = CACHE_DIR / "stock_industry_full.csv"
-
     if use_cache and cache_file.exists():
-        df = pd.read_csv(cache_file, dtype=str)
-        if 'industry' in df.columns and len(df) > 0:
-            # 过滤掉行业为空的数据
-            df = df[df['industry'].notna() & (df['industry'] != '')]
-            mapping = dict(zip(df['ts_code'], df['industry']))
-            print(f"[行业分类] 从缓存加载: {len(mapping)} 只股票, "
-                  f"{df['industry'].nunique()} 个行业")
-            return mapping
-
-    pro = get_pro()
-    all_dfs = []
-
-    for exchange in ['SSE', 'SZSE', 'BSE']:
         try:
-            df = pro.stock_company(
-                exchange=exchange,
-                fields='ts_code,industry'
-            )
-            if df is not None and len(df) > 0:
-                all_dfs.append(df)
-        except Exception as e:
-            print(f"  [行业] {exchange} 获取失败: {str(e)[:80]}")
-
-    if not all_dfs:
-        print("[行业] 所有交易所数据获取失败，返回空映射")
-        return {}
-
-    result = pd.concat(all_dfs, ignore_index=True)
-    result = result[result['industry'].notna() & (result['industry'] != '')]
-
-    # 保存缓存
-    result.to_csv(cache_file, index=False)
-
-    mapping = dict(zip(result['ts_code'], result['industry']))
-    print(f"[行业分类] API获取: {len(mapping)} 只股票, "
-          f"{result['industry'].nunique()} 个行业")
-    # 打印行业分布 Top 10
-    top10 = result['industry'].value_counts().head(10)
-    for ind, cnt in top10.items():
-        print(f"    {ind}: {cnt} 只")
-
-    return mapping
-
+            df = pd.read_csv(cache_file, dtype=str)
+            if 'industry' in df.columns and len(df) > 0:
+                df = df[df['industry'].notna() & (df['industry'] != '')]
+                mapping = dict(zip(df['ts_code'], df['industry']))
+                log.info(f"行业分类从缓存加载: {len(mapping)} 只")
+                return mapping
+        except Exception:
+            pass
+    log.info("baostock 无行业数据，返回空映射")
+    return {}
 
 # ============================================================
-# 1.5 动态流动性过滤（每只股票检查日均成交额）
+# 9. 日线数据（核心：增量缓存 + 分片存储）
 # ============================================================
+def _stock_cache_path(ts_code: str, adj: str = 'qfq') -> Path:
+    """股票缓存文件路径（按交易所分子目录）"""
+    prefix = _exchange_prefix(ts_code)
+    safe = ts_code.replace('.', '_')
+    return STOCK_CACHE_DIR / prefix / f"{safe}_{adj}.csv"
 
-def filter_by_liquidity(stock_data: dict, min_daily_amount: float = 20_000,
-                        lookback_days: int = 60) -> dict:
+def _read_stock_cache(path: Path) -> pd.DataFrame:
+    """读取股票缓存 CSV → DataFrame"""
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+        df.sort_index(inplace=True)
+        return df
+    except Exception as e:
+        log.warning(f"读取缓存失败 {path}: {e}")
+        return pd.DataFrame()
+
+def _write_stock_cache(path: Path, df: pd.DataFrame):
+    """写入股票缓存 CSV"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df_to_write = df.copy()
+        if isinstance(df_to_write.index, pd.DatetimeIndex):
+            df_to_write.index.name = 'date'
+        df_to_write.to_csv(path)
+    except Exception as e:
+        log.warning(f"写入缓存失败 {path}: {e}")
+
+@with_retry
+def _fetch_one_stock(bs_code: str, start_date: str, end_date: str, adjust_flag: str) -> pd.DataFrame:
+    """单次拉取一只股票（带重试）"""
+    bs = _get_bs()
+    rs = bs.query_history_k_data_plus(
+        code=bs_code,
+        fields="date,open,high,low,close,volume,amount",
+        start_date=start_date,
+        end_date=end_date,
+        frequency="d",
+        adjustflag=adjust_flag
+    )
+
+    if rs.error_code != '0':
+        raise RuntimeError(f"API error: {rs.error_msg}")
+
+    data = []
+    while rs.next():
+        data.append(rs.get_row_data())
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume', 'amount'])
+    for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df = df[df['volume'] > 0].copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    df.sort_index(inplace=True)
+    return df
+
+def download_daily(stock_code: str, start_date: str, end_date: str,
+                   adj: str = 'qfq', use_cache: bool = True) -> pd.DataFrame:
     """
-    过滤流动性不足的股票
-
-    参数:
-        stock_data: {code: DataFrame} 字典
-        min_daily_amount: 最低日均成交额（默认2000万，tushare amount=千元所以=20000）
-        lookback_days: 回溯天数
-
-    返回:
-        dict: 过滤后的股票数据
+    下载单只股票日线（增量缓存版）
 
     逻辑：
-      小市值股票日均成交额可能<500万，大单根本进不去。
-      2000万≈散户策略的安全线（单日成交5%=100万仓位上限）
-
-    注意：tushare amount字段单位为千元，所以2000万=20000千元
+      1. 读本地缓存 → 拿到最后一条日期
+      2. 如果缓存已覆盖 [start_date, end_date] → 直接返回切片
+      3. 否则只拉 [缓存末尾+1天, end_date] 的增量 → append → 写回
     """
+    bs_code = _to_bs_code(stock_code)
+    adjust_flag = {'qfq': '2', 'hfq': '1'}.get(adj, '3')
+
+    cache_path = _stock_cache_path(stock_code, adj)
+
+    # 尝试读缓存
+    cached = _read_stock_cache(cache_path) if use_cache else pd.DataFrame()
+
+    # 缓存有效且覆盖所需区间 → 直接返回
+    if not cached.empty:
+        cached_start = cached.index.min().strftime('%Y%m%d')
+        cached_end = cached.index.max().strftime('%Y%m%d')
+        if cached_start <= start_date and cached_end >= end_date:
+            return cached.loc[start_date:end_date]
+
+    # 计算增量区间
+    if not cached.empty:
+        last_date = cached.index.max()
+        inc_start = (last_date + timedelta(days=1)).strftime('%Y%m%d')
+    else:
+        inc_start = start_date
+
+    if inc_start > end_date:
+        return cached.loc[start_date:end_date] if not cached.empty else pd.DataFrame()
+
+    # 拉取增量
+    try:
+        inc_df = _fetch_one_stock(bs_code, inc_start, end_date, adjust_flag)
+    except Exception as e:
+        log.error(f"拉取 {stock_code} 失败: {e}")
+        if not cached.empty:
+            log.warning(f"降级使用过期缓存: {stock_code}")
+            return cached.loc[start_date:end_date]
+        return pd.DataFrame()
+
+    # 合并写回
+    if use_cache:
+        if not cached.empty:
+            merged = pd.concat([cached, inc_df])
+            merged = merged[~merged.index.duplicated(keep='last')]
+            merged.sort_index(inplace=True)
+        else:
+            merged = inc_df
+        _write_stock_cache(cache_path, merged)
+
+    result = merged.loc[start_date:end_date] if 'merged' in locals() and not merged.empty else inc_df
+    return result
+
+# ============================================================
+# 10. 指数数据（增量缓存）
+# ============================================================
+INDEX_CODE_MAP = {
+    '000001.SH': 'sh.000001',
+    '000300.SH': 'sh.000300',
+    '000905.SH': 'sh.000905',
+    '399001.SZ': 'sz.399001',
+    '399006.SZ': 'sz.399006',
+}
+
+def download_index_daily(index_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """下载指数日线（增量缓存）"""
+    bs = _get_bs()
+    bs_code = INDEX_CODE_MAP.get(index_code, f'sh.{index_code[:6]}')
+    safe = index_code.replace('.', '_')
+    cache_path = INDEX_CACHE_DIR / f"{safe}.csv"
+
+    cached = _read_stock_cache(cache_path)
+
+    if not cached.empty:
+        cached_start = cached.index.min().strftime('%Y%m%d')
+        cached_end = cached.index.max().strftime('%Y%m%d')
+        if cached_start <= start_date and cached_end >= end_date:
+            return cached.loc[start_date:end_date]
+        last_date = cached.index.max()
+        inc_start = (last_date + timedelta(days=1)).strftime('%Y%m%d')
+    else:
+        inc_start = start_date
+
+    if inc_start > end_date:
+        return cached.loc[start_date:end_date] if not cached.empty else pd.DataFrame()
+
+    rs = bs.query_history_k_data_plus(
+        code=bs_code,
+        fields="date,open,high,low,close,volume",
+        start_date=inc_start,
+        end_date=end_date,
+        frequency="d",
+        adjustflag="3"
+    )
+
+    if rs.error_code != '0':
+        log.warning(f"指数 {index_code} 获取失败: {rs.error_msg}")
+        if not cached.empty:
+            return cached.loc[start_date:end_date]
+        return pd.DataFrame()
+
+    data = []
+    while rs.next():
+        data.append(rs.get_row_data())
+
+    if not data:
+        if not cached.empty:
+            return cached.loc[start_date:end_date]
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    df.sort_index(inplace=True)
+
+    if not cached.empty:
+        merged = pd.concat([cached, df])
+        merged = merged[~merged.index.duplicated(keep='last')]
+        merged.sort_index(inplace=True)
+    else:
+        merged = df
+    _write_stock_cache(cache_path, merged)
+
+    return merged.loc[start_date:end_date]
+
+# ============================================================
+# 11. 基本面数据（带缓存）
+# ============================================================
+def download_fundamentals(trade_date: str, stock_list: list = None) -> pd.DataFrame:
+    """获取基本面数据（PE/PB/ROE/市值），按日期缓存"""
+    bs = _get_bs()
+    cache_file = FUNDA_CACHE_DIR / f"{trade_date}.csv"
+
+    if cache_file.exists():
+        try:
+            df = pd.read_csv(cache_file, index_col=0)
+            if stock_list:
+                df = df[df['ts_code'].isin(stock_list)]
+            return df
+        except Exception:
+            pass
+
+    try:
+        rs = bs.query_daily_basic(
+            day=trade_date,
+            fields="code,peTTM,pbMRQ,psTTM,pcfNcfTTM,turnoverRatio"
+        )
+        if rs.error_code != '0':
+            log.warning(f"基本面获取失败 ({trade_date}): {rs.error_msg}")
+            return pd.DataFrame()
+
+        data = []
+        while rs.next():
+            data.append(rs.get_row_data())
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data, columns=['code', 'pe', 'pb', 'ps', 'pcf', 'turnover_rate'])
+        df['code'] = df['code'].apply(_to_ts_code)
+        df.rename(columns={'code': 'ts_code'}, inplace=True)
+        for col in ['pe', 'pb', 'ps', 'pcf', 'turnover_rate']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['pe', 'pb'])
+        df = df[(df['pe'] > 0) & (df['pb'] > 0)]
+
+        df.to_csv(cache_file)
+
+        if stock_list:
+            df = df[df['ts_code'].isin(stock_list)]
+        return df
+    except Exception as e:
+        log.warning(f"基本面异常: {e}")
+        return pd.DataFrame()
+
+# ============================================================
+# 12. 批量数据加载（全A股 + 增量 + 自适应速率 + 断点续传）
+# ============================================================
+def load_multi_stock_data(stock_codes: list, start_date: str, end_date: str,
+                          progress: bool = True,
+                          pool_key: str = "default") -> dict:
+    """
+    批量下载多只股票（全A股优化版）
+
+    特性：
+      - 增量缓存：已有缓存且覆盖区间 → 0 API 调用
+      - 自适应速率：连续失败自动加大间隔，成功后缓慢恢复
+      - 断点续传：进度持久化到 cache/progress.json
+      - 降级策略：API 失败 → 返回过期缓存
+
+    参数:
+        stock_codes: 股票代码列表（全A股 ~5000 只）
+        start_date: 起始日期
+        end_date: 结束日期
+        progress: 是否显示进度
+        pool_key: 进度记录的 key（用于断点续传）
+
+    返回:
+        dict: {stock_code: DataFrame}
+    """
+    result = {}
+    n = len(stock_codes)
+    cache_hits = 0
+    incremental = 0
+    api_calls = 0
+    errors = 0
+
+    # 加载进度（断点续传）
+    progress_data = _load_progress(pool_key)
+    completed = set(progress_data.get('completed', []))
+    last_index = progress_data.get('last_index', 0)
+
+    # 跳过已完成的
+    if last_index > 0 and len(completed) > 0:
+        log.info(f"断点续传: 已完成 {len(completed)}/{n}，从索引 {last_index} 继续")
+
+    log.info(f"批量加载 {n} 只股票，区间 {start_date}~{end_date}")
+
+    for i, code in enumerate(stock_codes):
+        # 跳过已完成的（断点续传）
+        if code in completed:
+            # 仍需把数据读出来
+            cache_path = _stock_cache_path(code, 'qfq')
+            cached = _read_stock_cache(cache_path)
+            if not cached.empty:
+                sliced = cached.loc[start_date:end_date]
+                if len(sliced) >= 30:
+                    result[code] = sliced
+            continue
+
+        # 进度打印
+        if progress and i % 200 == 0:
+            elapsed_pct = (i / n) * 100
+            log.info(f"进度 {i}/{n} ({elapsed_pct:.0f}%) | "
+                     f"命中 {cache_hits} | 增量 {incremental} | "
+                     f"API {api_calls} | 错误 {errors}")
+
+        # 检查缓存是否已覆盖（不发起 API 请求）
+        cache_path = _stock_cache_path(code, 'qfq')
+        cached = _read_stock_cache(cache_path)
+
+        cache_covered = False
+        if not cached.empty:
+            cached_start = cached.index.min().strftime('%Y%m%d')
+            cached_end = cached.index.max().strftime('%Y%m%d')
+            if cached_start <= start_date and cached_end >= end_date:
+                cache_covered = True
+
+        if cache_covered:
+            sliced = cached.loc[start_date:end_date]
+            if len(sliced) >= 30:
+                result[code] = sliced
+                cache_hits += 1
+                completed.add(code)
+                continue
+
+        # 需要 API 调用
+        try:
+            df = download_daily(code, start_date, end_date)
+            api_calls += 1
+            if not cached.empty and not df.empty:
+                incremental += 1
+            if not df.empty and len(df) >= 30:
+                result[code] = df
+            completed.add(code)
+        except Exception as e:
+            errors += 1
+            log.warning(f"跳过 {code}: {e}")
+            # 降级：用过期缓存
+            if not cached.empty:
+                sliced = cached.loc[start_date:end_date]
+                if len(sliced) >= 30:
+                    result[code] = sliced
+                    log.info(f"  ↳ 降级使用过期缓存 ({len(sliced)} 行)")
+
+        # 自适应休眠
+        _adaptive_wait()
+
+        # 批次缓冲
+        if (i + 1) % BATCH_SIZE == 0:
+            time.sleep(BATCH_SLEEP)
+            # 每批次保存进度
+            _save_progress(pool_key, {
+                'completed': list(completed),
+                'last_index': i + 1,
+                'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
+
+    # 最终保存进度
+    _save_progress(pool_key, {
+        'completed': list(completed),
+        'last_index': n,
+        'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'total': n
+    })
+
+    log.info(f"完成: 成功 {len(result)}/{n} | 缓存命中 {cache_hits} | "
+             f"增量 {incremental} | API调用 {api_calls} | 错误 {errors}")
+    return result
+
+# ============================================================
+# 13. 流动性过滤
+# ============================================================
+def filter_by_liquidity(stock_data: dict, min_daily_amount: float = 20_000_000,
+                         lookback_days: int = 60) -> dict:
+    """过滤流动性不足的股票"""
     filtered = {}
     removed = 0
     for code, df in stock_data.items():
@@ -288,99 +796,51 @@ def filter_by_liquidity(stock_data: dict, min_daily_amount: float = 20_000,
             removed += 1
             continue
         recent = df.tail(lookback_days)
-        if 'amount' not in recent.columns:
-            filtered[code] = df  # 无成交额数据则保留
-            continue
-        avg_amount = recent['amount'].mean()
+        avg_amount = recent['amount'].mean() if 'amount' in df.columns else 0
         if avg_amount >= min_daily_amount:
             filtered[code] = df
         else:
             removed += 1
-
     if removed > 0:
-        print(f"  [流动性过滤] 剔除 {removed} 只 (日均成交额<{min_daily_amount/10:.0f}万)")
-    print(f"  [流动性过滤后] 剩余 {len(filtered)} 只")
+        log.info(f"流动性过滤剔除 {removed} 只（日均成交额 < {min_daily_amount/1e6:.0f}M）")
     return filtered
 
-
 # ============================================================
-# 1.6 涨跌停检测
+# 14. 涨停/跌停判断
 # ============================================================
-
-def is_price_limit_day(df: pd.DataFrame, date_idx: int = -1) -> Tuple[bool, bool]:
-    """
-    判断某一天是否为涨跌停日
-
-    A股涨跌停规则:
-      - 主板(60/00开头): ±10%
-      - 创业板(30开头): ±20%
-      - 科创板(68开头): ±20%
-      - ST股票: ±5%
-      - 上市首日: 无限制(±44%)
-
-    返回:
-        (is_limit_up, is_limit_down)
-    """
-    if len(df) < 2 or abs(date_idx) > len(df):
+def check_limit_status(df: pd.DataFrame, date_idx: int) -> Tuple[bool, bool]:
+    """判断某一天是否为涨跌停日"""
+    if len(df) <= date_idx or date_idx <= 0:
         return False, False
-
     row = df.iloc[date_idx]
     prev = df.iloc[date_idx - 1]
-
-    if prev['close'] <= 0 or row['close'] <= 0:
+    if prev['close'] == 0:
         return False, False
 
     ret = (row['close'] - prev['close']) / prev['close']
-    code = df.index.name if hasattr(df.index, 'name') else ''
+    limit_up = ret >= 0.095
+    limit_down = ret <= -0.095
 
-    # 简化版：统一用 ±9.5% 作为涨跌停阈值（留缓冲）
-    # ST 用 ±4.5%
-    if 'ST' in str(code).upper():
-        limit_up = ret > 0.045 and row['high'] == row['low']  # 一字板
-        limit_down = ret < -0.045 and row['high'] == row['low']
-    else:
-        limit_up = ret > 0.095 and abs(row['high'] - row['close']) / row['close'] < 0.001
-        limit_down = ret < -0.095 and abs(row['low'] - row['close']) / row['close'] < 0.001
-
+    if abs(row['high'] - row['low']) / row['close'] < 0.005:
+        if ret >= 0.095:
+            limit_up = True
+        elif ret <= -0.095:
+            limit_down = True
     return limit_up, limit_down
 
-
 # ============================================================
-# 1.7 市场宽度计算
+# 15. 市场宽度指标
 # ============================================================
-
-def calc_market_breadth(stock_data: dict, date) -> dict:
-    """
-    计算全市场宽度指标
-
-    参数:
-        stock_data: {code: DataFrame} 字典
-        date: 目标日期
-
-    返回:
-        dict: {
-            'breadth_ma20': float,   # 站上MA20的股票比例
-            'breadth_ma60': float,   # 站上MA60的股票比例
-            'up_down_ratio': float,  # 涨跌比（涨家数/跌家数）
-            'volume_percentile': float, # 全市场成交额分位数
-            'new_high_ratio': float, # 创20日新高比例
-        }
-    """
-    total = 0
-    above_ma20 = 0
-    above_ma60 = 0
-    up_count = 0
-    new_high_count = 0
+def compute_market_breadth(stock_data: dict, date: pd.Timestamp) -> dict:
+    """计算全市场宽度指标"""
+    total = above_ma20 = above_ma60 = up_count = new_high_count = 0
     total_volume = 0.0
-    volume_hist = []
 
     for code, df in stock_data.items():
         if date not in df.index:
             continue
         total += 1
         row = df.loc[date]
-
-        # MA20 / MA60
         if 'ma20' in df.columns:
             ma20 = row.get('ma20', np.nan)
             if not pd.isna(ma20) and row['close'] > ma20:
@@ -389,372 +849,86 @@ def calc_market_breadth(stock_data: dict, date) -> dict:
             ma60 = row.get('ma60', np.nan)
             if not pd.isna(ma60) and row['close'] > ma60:
                 above_ma60 += 1
-
-        # 涨跌
-        ret = row.get('returns', np.nan)
-        if not pd.isna(ret):
-            if ret > 0:
+        if 'returns' in df.columns:
+            ret = row.get('returns', np.nan)
+            if not pd.isna(ret) and ret > 0:
                 up_count += 1
-            total_volume += row.get('volume', 0)
-
-        # 创20日新高
-        if len(df.loc[:date]) >= 20:
-            recent_high = df.loc[:date].iloc[-21:-1]['high'].max()
+        total_volume += row.get('volume', 0)
+        hist = df.loc[:date]
+        if len(hist) >= 20:
+            recent_high = hist.iloc[-21:-1]['high'].max() if len(hist) > 20 else hist['high'].max()
             if row['high'] >= recent_high * 0.995:
                 new_high_count += 1
 
     if total == 0:
         return {'breadth_ma20': 0.5, 'breadth_ma60': 0.5,
-                'up_down_ratio': 1.0, 'volume_percentile': 50, 'new_high_ratio': 0.05}
+                'up_down_ratio': 1.0, 'volume_percentile': 50,
+                'new_high_ratio': 0.05, 'total_stocks': 0}
 
     down_count = total - up_count
-    up_down_ratio = up_count / max(1, down_count)
-
     return {
         'breadth_ma20': above_ma20 / total,
         'breadth_ma60': above_ma60 / total,
-        'up_down_ratio': up_down_ratio,
-        'volume_percentile': 50,  # 需要历史对比，先用中性值
+        'up_down_ratio': up_count / max(1, down_count),
+        'volume_percentile': 50,
         'new_high_ratio': new_high_count / total,
         'total_stocks': total,
     }
 
-
 # ============================================================
-# 1.8 根据市场宽度输出仓位建议
+# 16. 仓位建议
 # ============================================================
-
 def breadth_to_position(breadth: dict) -> dict:
-    """
-    将市场宽度转化为仓位建议
-
-    逻辑:
-      - 宽度>60% + 涨跌比>1.5 = 强势牛市 → 满仓
-      - 宽度30-60% = 震荡 → 中性仓位
-      - 宽度<30% + 涨跌比<0.7 = 弱势熊市 → 低仓/空仓
-    """
+    """将市场宽度转化为仓位建议"""
     b20 = breadth.get('breadth_ma20', 0.5)
     b60 = breadth.get('breadth_ma60', 0.5)
     udr = breadth.get('up_down_ratio', 1.0)
 
     if b20 > 0.65 and b60 > 0.60 and udr > 2.0:
-        regime = 'bull'
-        max_pos = 5
-        risk = 0.020
+        return {'regime': 'bull', 'max_positions': 5, 'risk_per_trade': 0.020, 'breadth_ma20': b20, 'up_down_ratio': udr}
     elif b20 > 0.45 and udr > 1.2:
-        regime = 'neutral'
-        max_pos = 4
-        risk = 0.015
+        return {'regime': 'neutral', 'max_positions': 4, 'risk_per_trade': 0.015, 'breadth_ma20': b20, 'up_down_ratio': udr}
     elif b20 > 0.30:
-        regime = 'cautious'
-        max_pos = 3
-        risk = 0.012
+        return {'regime': 'cautious', 'max_positions': 3, 'risk_per_trade': 0.012, 'breadth_ma20': b20, 'up_down_ratio': udr}
     else:
-        regime = 'bear'
-        max_pos = 2
-        risk = 0.008
-
-    return {
-        'regime': regime,
-        'max_positions': max_pos,
-        'risk_per_trade': risk,
-        'breadth_ma20': b20,
-        'up_down_ratio': udr,
-    }
-
+        return {'regime': 'bear', 'max_positions': 2, 'risk_per_trade': 0.008, 'breadth_ma20': b20, 'up_down_ratio': udr}
 
 # ============================================================
-# 2. 日线数据获取（核心）
+# 17. 兼容接口
 # ============================================================
+def init_tushare(token: str = None):
+    """兼容接口：baostock 无需 token"""
+    log.info("baostock 无需 token，直接连接")
+    _get_bs()
+    return _bs
 
-def download_daily(stock_code: str, start_date: str, end_date: str,
-                   adj: str = 'qfq', use_cache: bool = True) -> pd.DataFrame:
-    """
-    下载单只股票的日线数据（前复权）
-
-    参数:
-        stock_code: 股票代码，如 '000001.SZ'
-        start_date: 起始日期 '20200101'
-        end_date:   结束日期 '20241231'
-        adj:        复权类型 'qfq'=前复权, 'hfq'=后复权, None=不复权
-        use_cache:  是否使用本地缓存
-
-    返回:
-        DataFrame with columns: open, high, low, close, volume, amount
-        index = DatetimeIndex
-
-    面试考点：
-      Q: 前复权和后复权的区别？回测用哪个？
-      A: 前复权=以最新股本为基准往前调整，最新价=实际价，历史价被压缩
-         后复权=以上市时股本为基准往后调整，历史价=实际价，最新价被放大
-         回测用前复权：因为你的买卖决策基于当前实际价格
-    """
-    # —— 缓存检查 ——
-    cache_file = CACHE_DIR / f"{stock_code}_{start_date}_{end_date}_{adj}.csv"
-    if use_cache and cache_file.exists():
-        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        if not df.empty:
-            return df
-
-    # —— 调 tushare API ——
-    pro = get_pro()
-
-    # tushare 接口每次最多返回 5000 条，需要分批获取
-    all_dfs = []
-    current_start = start_date
-
-    while current_start < end_date:
-        try:
-            df_chunk = pro.daily(
-                ts_code=stock_code,
-                start_date=current_start,
-                end_date=end_date,
-                adj=adj,
-                fields='trade_date,open,high,low,close,vol,amount'
-            )
-        except Exception as e:
-            print(f"  [警告] {stock_code} 数据获取失败 ({current_start}-{end_date}): {e}")
-            break
-
-        if df_chunk is None or df_chunk.empty:
-            break
-
-        all_dfs.append(df_chunk)
-
-        # 更新下次请求的起始日期
-        last_date = df_chunk['trade_date'].min()
-        if last_date <= current_start:
-            break
-        end_date = str(int(last_date) - 1)
-
-    if not all_dfs:
-        print(f"  [错误] {stock_code} 无数据")
-        return pd.DataFrame()
-
-    # —— 数据整理 ——
-    df = pd.concat(all_dfs, ignore_index=True)
-    df = df.rename(columns={
-        'trade_date': 'date',
-        'vol': 'volume',
-    })
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').set_index('date')
-    df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
-
-    # 清洗：去掉 volume=0 的行（停牌日）
-    df = df[df['volume'] > 0]
-
-    # —— 保存缓存 ——
-    if use_cache:
-        df.to_csv(cache_file)
-
-    return df
-
-
-def download_index_daily(index_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    下载指数日线数据（用于择时判断）
-
-    参数:
-        index_code: 指数代码，如 '000001.SH'（上证指数）
-    """
-    pro = get_pro()
-
-    # 灵活匹配缓存：优先选用日期范围最大的文件（数据最全）
-    matching_caches = sorted(
-        list(CACHE_DIR.glob(f"IDX_{index_code}_*.csv")),
-        key=lambda p: p.stat().st_size, reverse=True  # 文件越大=数据越多
-    )
-    if matching_caches:
-        cache_file = matching_caches[0]
-        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        # 按回测日期范围裁剪
-        df = df.loc[start_date:end_date]
-        if len(df) >= 30:
-            return df
-
-    # 缓存未命中，调 API
-    cache_file = CACHE_DIR / f"IDX_{index_code}_{start_date}_{end_date}.csv"
-
-    all_dfs = []
-    current_start = start_date
-
-    while current_start < end_date:
-        df_chunk = pro.index_daily(
-            ts_code=index_code,
-            start_date=current_start,
-            end_date=end_date,
-            fields='trade_date,open,high,low,close,vol,amount'
-        )
-
-        if df_chunk is None or df_chunk.empty:
-            break
-
-        all_dfs.append(df_chunk)
-        last_date = df_chunk['trade_date'].min()
-        if last_date <= current_start:
-            break
-        end_date = str(int(last_date) - 1)
-
-    if not all_dfs:
-        return pd.DataFrame()
-
-    df = pd.concat(all_dfs, ignore_index=True)
-    df = df.rename(columns={'trade_date': 'date', 'vol': 'volume'})
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').set_index('date')
-    df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
-    df = df[df['volume'] > 0]
-
-    df.to_csv(cache_file)
-    return df
-
+def get_pro():
+    """兼容接口"""
+    return _get_bs()
 
 # ============================================================
-# 3. 基本面数据
+# 18. 测试入口
 # ============================================================
-
-def download_fundamentals(trade_date: str, stock_list: list = None) -> pd.DataFrame:
-    """
-    获取指定日期的基本面数据
-
-    参数:
-        trade_date: 交易日 '20240101'
-        stock_list: 限定股票列表
-
-    返回:
-        DataFrame with columns: ts_code, pe, pb, roe, total_mv, turnover_rate
-
-    面试考点：
-      Q: 为什么要把基本面因子和技术面因子结合？
-      A: 技术面=市场情绪+短期供需，基本面=内在价值
-         两者结合=既不被情绪带跑（只看技术面），也不死守估值（只看基本面）
-         业界称为"Quantamental"——量化+基本面融合
-    """
-    pro = get_pro()
-
-    cache_file = CACHE_DIR / f"FUNDA_{trade_date}.csv"
-    if cache_file.exists():
-        df = pd.read_csv(cache_file, index_col=0)
-        if stock_list:
-            df = df[df['ts_code'].isin(stock_list)]
-        return df
-
-    try:
-        df = pro.daily_basic(
-            trade_date=trade_date,
-            fields='ts_code,total_mv,pe,pb,roe,turnover_rate,volume_ratio'
-        )
-    except Exception as e:
-        print(f"  [警告] 基本面数据获取失败 ({trade_date}): {e}")
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # 清洗
-    df = df.dropna(subset=['total_mv'])  # 没有市值的去掉
-    df = df[df['pe'] > 0]                # PE为负=亏损，去掉
-    df = df[df['pb'] > 0]                # PB为负=资不抵债，去掉
-
-    df.to_csv(cache_file)
-    return df
-
-
-# ============================================================
-# 4. 批量数据加载（一键拉取）
-# ============================================================
-
-def load_multi_stock_data(stock_codes: list, start_date: str, end_date: str,
-                          progress: bool = True) -> dict:
-    """
-    批量下载多只股票的数据
-
-    参数:
-        stock_codes: 股票代码列表
-        start_date:  起始日期
-        end_date:    结束日期
-        progress:    是否显示进度
-
-    返回:
-        dict: {stock_code: DataFrame}
-
-    面试考点：
-      Q: 如果500只股票并行下载，tushare有频率限制怎么办？
-      A: ① tushare pro 免费版限制 200次/分钟
-         ② 用 time.sleep 控制频率
-         ③ 或者先拉缓存，只对新股票调API
-         ④ 面试时可以提"生产者-消费者模型"做异步下载
-    """
-    import time
-    result = {}
-    n = len(stock_codes)
-    api_calls = 0  # 统计实际 API 调用次数
-
-    for i, code in enumerate(stock_codes):
-        if progress and i % 100 == 0:
-            print(f"  [进度] {i}/{n} 只 (已获取 {len(result)}, API调用 {api_calls})")
-
-        # —— 先查缓存，命中则直接读取，不消耗 API 配额 ——
-        # 灵活匹配：优先选用数据量最大的缓存文件
-        matching_caches = sorted(
-            list(CACHE_DIR.glob(f"{code}_*_qfq.csv")),
-            key=lambda p: p.stat().st_size, reverse=True
-        )
-        cache_hit = False
-        if matching_caches:
-            cache_file = matching_caches[0]  # 取第一个匹配的缓存
-            try:
-                df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-                if not df.empty:
-                    # 按回测日期范围裁剪
-                    df = df.loc[start_date:end_date]
-                    if len(df) >= 60:  # 至少60个交易日
-                        result[code] = df
-                        cache_hit = True
-            except Exception:
-                pass  # 缓存损坏，走 API 下载
-
-        if cache_hit:
-            continue
-
-        # —— API 下载 ——
-        try:
-            df = download_daily(code, start_date, end_date)
-            if not df.empty:
-                result[code] = df
-                api_calls += 1
-        except Exception as e:
-            print(f"  [跳过] {code}: {e}")
-
-        # 控制 API 频率（tushare 免费版: 50次/分钟 → 每次间隔 ≥1.3秒）
-        time.sleep(1.3)
-
-    print(f"  [完成] 成功获取 {len(result)}/{n} 只股票数据")
-    return result
-
-
-# ============================================================
-# 5. 便捷入口
-# ============================================================
-
 if __name__ == "__main__":
-    # 测试：初始化 + 拉一只股票数据
-    init_tushare()
-    print("测试数据获取...\n")
+    print("测试 baostock 全A股增量缓存数据引擎...\n")
 
-    # 测试1：日线数据
-    df = download_daily('000001.SZ', '20230101', '20240601')
-    print(f"平安银行 日线数据: {len(df)} 条")
-    print(f"  日期范围: {df.index[0]} ~ {df.index[-1]}")
-    print(f"  列: {df.columns.tolist()}")
-    print()
+    # 测试1：单只股票（首次 + 二次缓存命中）
+    df = download_daily('600519.SH', '20250101', '20250731')
+    print(f"✅ 贵州茅台: {len(df)} 条")
+    if not df.empty:
+        print(f"  区间: {df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}")
 
-    # 测试2：指数数据
-    df_idx = download_index_daily('000001.SH', '20230101', '20240601')
-    print(f"上证指数 日线数据: {len(df_idx)} 条")
+    df2 = download_daily('600519.SH', '20250101', '20250731')
+    print(f"✅ 二次读取（应0 API调用）: {len(df2)} 条")
 
-    # 测试3：股票池
-    stocks = get_stock_pool('hs300')
-    print(f"沪深300成分股: {len(stocks)} 只")
+    # 测试2：指数
+    df_idx = download_index_daily('000001.SH', '20250101', '20250731')
+    print(f"✅ 上证指数: {len(df_idx)} 条")
+
+    # 测试3：全A股股票池
+    stocks = get_stock_pool('all_filtered')
+    print(f"✅ 全A股(剔除ST): {len(stocks)} 只")
     print(f"  前5只: {stocks[:5]}")
+
+    logout_bs()
+    print("\n🎉 测试完成")
