@@ -2,19 +2,19 @@ name: AlphaReversal Daily Signal
 
 "on":
   schedule:
-    - cron: '30 8 * * 1-5'   # 工作日 16:30 北京时间 = UTC 08:30
+    - cron: '30 8 * * 1-5'
   workflow_dispatch:
     inputs:
       pool:
         description: '股票池'
         required: false
-        default: 'all_filtered'
+        default: 'hs300'
         type: choice
         options:
-          - all_filtered
-          - top1500
           - hs300
           - zz500
+          - top1500
+          - all_filtered
 
 env:
   FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
@@ -22,7 +22,7 @@ env:
 jobs:
   daily-signal:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 180
     env:
       PYTHONUNBUFFERED: "1"
 
@@ -41,64 +41,24 @@ jobs:
           pip install -r requirements.txt
           pip install requests
 
-      - name: 🔧 配置初始化
-        run: |
-          if [ -f config_template.py ]; then
-            cp config_template.py config.py
-            echo "✅ 已生成 config.py"
-          fi
-
-      # ── 关键：下载历史缓存（如有）──
-      - name: 📦 下载 baostock 缓存
+      - name: 📦 下载历史缓存
         uses: actions/download-artifact@v4
         with:
           name: baostock-cache
           path: cache/
         continue-on-error: true
 
-      - name: 📊 缓存状态
-        run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  缓存目录状态"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          if [ -d cache/stocks ]; then
-            echo "📂 股票缓存: $(ls cache/stocks/ 2>/dev/null | wc -l) 只"
-          else
-            echo "📂 股票缓存: 空（首次运行将全量下载）"
-            mkdir -p cache/stocks cache/index cache/pool cache/funda
-          fi
-          if [ -d cache/index ]; then
-            echo "📂 指数缓存: $(ls cache/index/ 2>/dev/null | wc -l) 个"
-          fi
-
       - name: 🚀 运行当日策略（增量模式）
         run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  AlphaReversal 每日回测（增量缓存版）"
-          echo "  时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-          # 数据区间：70 天前 ~ 今天
           START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
           END=$(TZ='Asia/Shanghai' date +%Y%m%d)
-          POOL="${{ github.event.inputs.pool || 'all_filtered' }}"
-
-          echo "📅 数据区间: $START ~ $END"
-          echo "🔄 增量模式：$POOL"
-          echo ""
-
+          POOL="${{ github.event.inputs.pool || 'hs300' }}"
           python scripts/run.py \
             --pool $POOL \
             --start $START \
             --end $END \
-            --no-plot \
-            --execution next_open
-
-      - name: 📊 推送飞书（完整卡片）
-        if: env.FEISHU_WEBHOOK != ''
-        run: |
-          echo "📤 推送飞书..."
-          python feishu_notify.py --mode full --no-image
+            --incremental \
+            --no-plot
 
       - name: 📤 上传更新后的缓存
         uses: actions/upload-artifact@v4
@@ -107,18 +67,18 @@ jobs:
           path: cache/
           retention-days: 90
 
+      - name: 📊 推送飞书
+        if: env.FEISHU_WEBHOOK != ''
+        run: python feishu_notify.py
+
       - name: 📋 打印摘要
         if: always()
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  运行结束"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📂 缓存统计:"
-          echo "  股票: $(ls cache/stocks/ 2>/dev/null | wc -l) 只"
-          echo "  指数: $(ls cache/index/ 2>/dev/null | wc -l) 个"
-          echo "  股票池快照: $(ls cache/pool/ 2>/dev/null | wc -l) 个"
+          ls -la output/ 2>/dev/null || echo "output/ 不存在"
           if [ -f output/trades.csv ]; then
-            echo ""
             echo "📄 最近交易记录:"
             tail -5 output/trades.csv
           fi
