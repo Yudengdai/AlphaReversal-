@@ -901,12 +901,12 @@ class BacktestEngine:
                         if code in stock_data and date in stock_data[code].index:
                             stock_df = stock_data[code]
                             date_idx = stock_df.index.get_loc(date)
-                            t_limit_up, t_limit_down = is_price_limit_day(stock_df, date_idx)
+                            t_limit_up, t_limit_down = is_price_limit_day(stock_df, date_idx, code)
                             if t_limit_up or t_limit_down:
                                 continue
                             if exec_date in stock_df.index:
                                 t1_idx = stock_df.index.get_loc(exec_date)
-                                t1_up, t1_down = is_price_limit_day(stock_df, t1_idx)
+                                t1_up, t1_down = is_price_limit_day(stock_df, t1_idx, code)
                                 if t1_up or t1_down:
                                     continue
 

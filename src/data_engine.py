@@ -128,10 +128,13 @@ def _stock_cache_path(ts_code: str) -> str:
 
 
 def _read_cache(filepath: str) -> Optional[pd.DataFrame]:
-    """读取 CSV 缓存，返回 DataFrame 或 None"""
+    """读取 CSV 缓存，返回带日期索引的 DataFrame 或 None"""
     if os.path.exists(filepath):
         try:
             df = pd.read_csv(filepath, parse_dates=['date'])
+            if df.empty:
+                return None
+            df.set_index('date', inplace=True)
             return df
         except Exception as e:
             logger.warning(f"缓存读取失败 {filepath}: {e}")
@@ -139,17 +142,20 @@ def _read_cache(filepath: str) -> Optional[pd.DataFrame]:
 
 
 def _write_cache(df: pd.DataFrame, filepath: str):
-    """写入 CSV 缓存"""
+    """写入 CSV 缓存（date 索引转为列存储，便于兼容与调试）"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    df.to_csv(filepath, index=False)
+    out = df.copy()
+    if isinstance(out.index, pd.DatetimeIndex):
+        out = out.reset_index()  # date 索引 → date 列
+    out.to_csv(filepath, index=False)
 
 
 def _merge_and_write_cache(old_df: Optional[pd.DataFrame], new_df: pd.DataFrame, filepath: str):
-    """合并新旧数据并写入缓存（去重）"""
+    """合并新旧数据并写入缓存（按日期索引去重）"""
     if old_df is not None and not old_df.empty:
-        combined = pd.concat([old_df, new_df], ignore_index=True)
-        combined.drop_duplicates(subset=['date'], keep='last', inplace=True)
-        combined.sort_values('date', inplace=True)
+        combined = pd.concat([old_df, new_df])
+        combined = combined[~combined.index.duplicated(keep='last')]
+        combined.sort_index(inplace=True)
     else:
         combined = new_df.copy()
     _write_cache(combined, filepath)
@@ -209,7 +215,12 @@ def _adaptive_sleep(success: bool):
 def get_stock_pool(pool_name: str = "hs300") -> List[str]:
     """
     获取股票池（返回 tushare 格式代码列表）
-    支持: hs300, zz500, top1500, all_filtered
+    支持: hs300, zz500, top1500, all_filtered, all, top20
+
+    注意：
+    - hs300/zz500 用 baostock 指数成分接口
+    - all/all_filtered/top1500/top20 用 query_stock_basic（type=1 才是股票，
+      排除指数/转债/ETF；query_all_stock 会混入指数，不可用）
     """
     ensure_login()
     _ensure_cache_dirs()
@@ -228,8 +239,8 @@ def get_stock_pool(pool_name: str = "hs300") -> List[str]:
     elif pool_name == "zz500":
         rs = bs.query_zz500_stocks()
     elif pool_name in ("all", "all_filtered", "top1500", "top20"):
-        # 全A股（含沪/深/创业板/科创板/北交所）
-        rs = bs.query_all_stock(day=datetime.date.today().strftime("%Y-%m-%d"))
+        # 全A股：query_stock_basic 的 type=1 才是股票（排除指数/转债/ETF）
+        rs = bs.query_stock_basic()
     else:
         raise ValueError(f"Unknown pool: {pool_name}")
 
@@ -238,21 +249,39 @@ def get_stock_pool(pool_name: str = "hs300") -> List[str]:
         row = rs.get_row_data()
         if not row or not row[0]:  # 代码
             continue
-        code = row[0]
-        # all_filtered：剔除名称含 ST / 退 的股票
-        if pool_name == "all_filtered" and len(row) > 2:
-            name = row[2] if row[2] else ""
-            if "ST" in name.upper() or "退" in name:
-                continue
-        ts_code = _to_ts_code(code)
+        # 全A股池：只保留 type=1 的股票
+        if pool_name in ("all", "all_filtered", "top1500", "top20"):
+            if len(row) <= 4 or row[4] != '1':
+                continue  # 指数(2)/转债(4)/ETF(5)等全部排除
+            # all_filtered：剔除名称含 ST / 退 的股票
+            if pool_name == "all_filtered":
+                name = row[1] if len(row) > 1 and row[1] else ""
+                if "ST" in name.upper() or "退" in name:
+                    continue
+            raw_code = row[0]
+        else:
+            # hs300/zz500：返回格式为 [updateDate, code, code_name]，code 在第 1 列
+            raw_code = row[1]
+        ts_code = _to_ts_code(raw_code)
         codes.append(ts_code)
 
     if pool_name == "top1500":
         # 简化处理：取前1500（未真正按市值排序，市值排序需额外接口）
         codes = codes[:1500]
     elif pool_name == "top20":
-        # 调试用：前20只
-        codes = codes[:20]
+        # 调试用：优先用中证500成分股（存活股，避免 query_stock_basic 里的退市代码）
+        try:
+            rs = bs.query_zz500_stocks()
+            live = []
+            while rs.next() and len(live) < 20:
+                row = rs.get_row_data()
+                if row and len(row) > 1 and row[1]:
+                    live.append(_to_ts_code(row[1]))
+            if live:
+                codes = live[:20]
+        except Exception as e:
+            logger.warning(f"top20 改用 zz500 成分失败: {e}，回退前20只")
+            codes = codes[:20]
 
     # 缓存股票池
     pd.DataFrame({'code': codes}).to_csv(pool_cache_file, index=False)
@@ -262,8 +291,20 @@ def get_stock_pool(pool_name: str = "hs300") -> List[str]:
 
 # ============ 数据下载 ============
 
+def _normalize_date(d: str) -> str:
+    """将 YYYYMMDD 统一转为 YYYY-MM-DD（baostock 要求带横线格式）"""
+    if not d:
+        return d
+    d = d.strip()
+    if len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return d
+
+
 def _fetch_one_stock(bs_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
     """拉取单只股票日线数据（内部函数，带重试）"""
+    start_date = _normalize_date(start_date)
+    end_date = _normalize_date(end_date)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             rs = bs.query_history_k_data_plus(
@@ -287,6 +328,7 @@ def _fetch_one_stock(bs_code: str, start_date: str, end_date: str) -> Optional[p
             for col in ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)  # 统一日期索引（backtest/factor 均按日期索引访问）
             return df
         except Exception as e:
             logger.warning(f"_fetch_one_stock 失败 (尝试 {attempt}/{MAX_RETRIES}): {e}，{RETRY_BACKOFF[min(attempt-1, len(RETRY_BACKOFF)-1)]}s 后重试")
@@ -297,13 +339,21 @@ def _fetch_one_stock(bs_code: str, start_date: str, end_date: str) -> Optional[p
 
 
 def download_daily(codes: List[str], start_date: str, end_date: str,
-                   use_cache: bool = True, incremental: bool = True) -> Dict[str, pd.DataFrame]:
+                   use_cache: bool = True, incremental: bool = True,
+                   progress: bool = True, pool_key: str = "download_daily") -> Dict[str, pd.DataFrame]:
     """
     批量下载日线数据（支持增量缓存）
     返回 {ts_code: DataFrame}
+
+    progress: 是否启用断点续传（默认 True）
+    pool_key: 断点续传的 key（不同股票池分开记，默认 download_daily）
     """
     ensure_login()
     _ensure_cache_dirs()
+
+    # 统一日期格式为 YYYY-MM-DD（避免 baostock 报"日期格式不正确"）
+    start_date = _normalize_date(start_date)
+    end_date = _normalize_date(end_date)
 
     result = {}
     total = len(codes)
@@ -312,9 +362,9 @@ def download_daily(codes: List[str], start_date: str, end_date: str,
     errors = 0
 
     # 断点续传
-    progress = _load_progress("download_daily")
-    completed_set = set(progress.get("completed", []))
-    last_index = progress.get("last_index", 0)
+    progress_state = _load_progress(pool_key) if progress else {}
+    completed_set = set(progress_state.get("completed", []))
+    last_index = progress_state.get("last_index", 0)
 
     for idx, ts_code in enumerate(codes):
         if idx < last_index and ts_code in completed_set:
@@ -331,16 +381,22 @@ def download_daily(codes: List[str], start_date: str, end_date: str,
 
         # 确定需要拉取的日期范围
         if incremental and cached_df is not None and not cached_df.empty:
-            last_date = cached_df['date'].max()
-            need_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            if need_start > end_date:
-                # 缓存已覆盖所需区间
-                result[ts_code] = cached_df
-                cache_hits += 1
-                # 标记完成
-                completed_set.add(ts_code)
-                _save_progress("download_daily", {"completed": list(completed_set), "last_index": idx + 1, "total": total})
-                continue
+            cache_start = cached_df.index.min()
+            if start_date >= cache_start.strftime("%Y-%m-%d"):
+                # 新请求起点不早于缓存起点：增量拉尾部
+                last_date = cached_df.index.max()
+                need_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                if need_start > end_date:
+                    # 缓存已覆盖所需区间
+                    result[ts_code] = cached_df
+                    cache_hits += 1
+                    # 标记完成
+                    completed_set.add(ts_code)
+                    _save_progress(pool_key, {"completed": list(completed_set), "last_index": idx + 1, "total": total})
+                    continue
+            else:
+                # 新请求起点更早：全量重拉（覆盖更早区间）
+                need_start = start_date
         else:
             need_start = start_date
 
@@ -364,7 +420,7 @@ def download_daily(codes: List[str], start_date: str, end_date: str,
 
         # 标记完成
         completed_set.add(ts_code)
-        _save_progress("download_daily", {"completed": list(completed_set), "last_index": idx + 1, "total": total})
+        _save_progress(pool_key, {"completed": list(completed_set), "last_index": idx + 1, "total": total})
 
         # 进度日志
         if (idx + 1) % 50 == 0 or idx == total - 1:
@@ -382,7 +438,7 @@ def download_daily(codes: List[str], start_date: str, end_date: str,
     if os.path.exists(PROGRESS_FILE):
         try:
             all_progress = json.load(open(PROGRESS_FILE))
-            all_progress.pop("download_daily", None)
+            all_progress.pop(pool_key, None)
             with open(PROGRESS_FILE, 'w') as f:
                 json.dump(all_progress, f, indent=2)
         except:
@@ -394,14 +450,19 @@ def download_daily(codes: List[str], start_date: str, end_date: str,
 
 
 def load_multi_stock_data(codes: List[str], start_date: str, end_date: str,
-                          use_cache: bool = True, incremental: bool = True) -> Dict[str, pd.DataFrame]:
+                          use_cache: bool = True, incremental: bool = True,
+                          progress: bool = True, pool_key: str = "download_daily") -> Dict[str, pd.DataFrame]:
     """
-    兼容原版接口名，与 download_daily 相同
+    兼容原版接口名，与 download_daily 相同（支持断点续传参数）
     """
-    return download_daily(codes, start_date, end_date, use_cache, incremental)
+    return download_daily(codes, start_date, end_date, use_cache, incremental,
+                          progress=progress, pool_key=pool_key)
 
 
 def download_index_daily(index_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    start_date = _normalize_date(start_date)
+    end_date = _normalize_date(end_date)
+
     """下载指数日线数据"""
     ensure_login()
     _ensure_cache_dirs()
@@ -411,10 +472,16 @@ def download_index_daily(index_code: str, start_date: str, end_date: str) -> Opt
 
     # 增量逻辑
     if cached_df is not None and not cached_df.empty:
-        last_date = cached_df['date'].max()
-        need_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        if need_start > end_date:
-            return cached_df
+        cache_start = cached_df.index.min()
+        last_date = cached_df.index.max()
+        if start_date >= cache_start.strftime("%Y-%m-%d"):
+            # 新请求起点不早于缓存起点：增量拉缺失尾部
+            need_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            if need_start > end_date:
+                return cached_df
+        else:
+            # 新请求起点更早：全量重拉（覆盖更早区间）
+            need_start = start_date
     else:
         need_start = start_date
 
@@ -439,6 +506,7 @@ def download_index_daily(index_code: str, start_date: str, end_date: str) -> Opt
     for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
         df_new[col] = pd.to_numeric(df_new[col], errors='coerce')
     df_new['date'] = pd.to_datetime(df_new['date'])
+    df_new.set_index('date', inplace=True)  # 统一日期索引
 
     merged = _merge_and_write_cache(cached_df, df_new, cache_path)
     time.sleep(REQUEST_SLEEP)
@@ -447,15 +515,66 @@ def download_index_daily(index_code: str, start_date: str, end_date: str) -> Opt
 
 # ============ 其他工具函数 ============
 
-def filter_by_liquidity(df: pd.DataFrame, min_amount: float = 1e8) -> pd.DataFrame:
-    """按成交额过滤流动性不足的股票（每日）"""
-    if 'amount' not in df.columns:
-        return df
-    return df[df['amount'] >= min_amount]
+def is_price_limit_day(df: pd.DataFrame, idx: int, ts_code: str = '') -> tuple:
+    """
+    判断某天是否涨/跌停（用于交易保护）。
+    A股涨跌停幅度：主板/中小板 10%，创业板(300)/科创板(688) 20%，北交所(8/4开头) 30%。
+    根据代码前缀判断，用 close vs preclose 计算实际涨跌幅。
+    返回 (is_limit_up, is_limit_down)
+    """
+    if df is None or df.empty or idx < 1:
+        return False, False
+    if idx >= len(df):
+        idx = len(df) - 1
+    code = str(ts_code or '')
+    if code.startswith(('300', '301', '688', '689')):
+        limit_pct = 0.20
+    elif code.startswith(('8', '4', '92')):
+        limit_pct = 0.30
+    else:
+        limit_pct = 0.10
+
+    close = df['close'].iloc[idx]
+    preclose = df['preclose'].iloc[idx] if 'preclose' in df.columns else df['close'].iloc[idx - 1]
+    if preclose is None or pd.isna(preclose) or preclose <= 0:
+        return False, False
+    pct = (close - preclose) / preclose
+    # 允许 ±0.5% 容差（四舍五入到分后可能略低于名义幅度）
+    return pct >= limit_pct - 0.005, pct <= -(limit_pct - 0.005)
 
 
-def get_stock_sectors(ts_code: str) -> Dict[str, str]:
-    """获取股票所属行业（baostock 无申万行业，返回空）"""
+def filter_by_liquidity(data: Dict[str, pd.DataFrame], min_daily_amount: float = 2e7) -> Dict[str, pd.DataFrame]:
+    """
+    按日均成交额过滤流动性不足的股票
+
+    参数:
+        data: {ts_code: DataFrame}，DataFrame 需含 amount 列
+        min_daily_amount: 日均成交额下限（元），默认 2000 万
+
+    返回:
+        过滤后的 {ts_code: DataFrame}
+    """
+    result = {}
+    for ts_code, df in data.items():
+        if df is None or df.empty:
+            continue
+        if 'amount' not in df.columns:
+            # 没有成交额字段，保守保留（无法判断流动性）
+            result[ts_code] = df
+            continue
+        avg_amount = df['amount'].mean()
+        if avg_amount >= min_daily_amount:
+            result[ts_code] = df
+        else:
+            logger.info(f"流动性过滤剔除: {ts_code} (日均成交额 {avg_amount/1e4:.0f}万 < {min_daily_amount/1e4:.0f}万)")
+    return result
+
+
+def get_stock_sectors(ts_code: str = None) -> Dict[str, str]:
+    """
+    获取股票所属行业（baostock 无申万行业数据，返回空）
+    兼容两种调用：get_stock_sectors() 全量 或 get_stock_sectors(code) 单只
+    """
     return {}
 
 
