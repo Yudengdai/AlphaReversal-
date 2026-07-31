@@ -4,6 +4,17 @@ name: AlphaReversal Daily Signal
   schedule:
     - cron: '30 8 * * 1-5'   # 工作日 16:30 北京时间 = UTC 08:30
   workflow_dispatch:
+    inputs:
+      pool:
+        description: '股票池'
+        required: false
+        default: 'all_filtered'
+        type: choice
+        options:
+          - all_filtered
+          - top1500
+          - hs300
+          - zz500
 
 env:
   FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
@@ -70,13 +81,14 @@ jobs:
           # 数据区间：70 天前 ~ 今天
           START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
           END=$(TZ='Asia/Shanghai' date +%Y%m%d)
+          POOL="${{ github.event.inputs.pool || 'all_filtered' }}"
 
           echo "📅 数据区间: $START ~ $END"
-          echo "🔄 增量模式：只拉取缓存缺失的日期"
+          echo "🔄 增量模式：$POOL"
           echo ""
 
           python scripts/run.py \
-            --pool hs300 \
+            --pool $POOL \
             --start $START \
             --end $END \
             --no-plot \
