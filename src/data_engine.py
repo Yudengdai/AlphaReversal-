@@ -3,6 +3,7 @@
 """
 数据引擎 - baostock 版
 支持增量缓存、自适应限速、全A股、断点续传
+兼容原版 AlphaReversal 接口（load_multi_stock_data 等）
 """
 
 import os
@@ -241,7 +242,6 @@ def get_stock_pool(pool_name: str = "hs300") -> List[str]:
 
     if pool_name == "top1500":
         # 需要市值排序，这里简化处理：取前1500
-        # 实际项目中应调用 query_stock_basic 获取市值
         codes = codes[:1500]
 
     # 缓存股票池
@@ -381,6 +381,14 @@ def download_daily(codes: List[str], start_date: str, end_date: str,
     logger.info(f"完成: 成功 {len(result)}/{total} | 缓存命中 {cache_hits} | "
                 f"增量 {api_calls} | API调用 {api_calls} | 错误 {errors}")
     return result
+
+
+def load_multi_stock_data(codes: List[str], start_date: str, end_date: str,
+                          use_cache: bool = True, incremental: bool = True) -> Dict[str, pd.DataFrame]:
+    """
+    兼容原版接口名，与 download_daily 相同
+    """
+    return download_daily(codes, start_date, end_date, use_cache, incremental)
 
 
 def download_index_daily(index_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
