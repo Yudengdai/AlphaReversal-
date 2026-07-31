@@ -53,11 +53,12 @@ jobs:
           START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
           END=$(TZ='Asia/Shanghai' date +%Y%m%d)
           POOL="${{ github.event.inputs.pool || 'hs300' }}"
+          # 注意：scripts/run.py 的增量缓存是默认开启的，无需传 --incremental
+          # 如需强制全量重拉，传 --no-incremental
           python scripts/run.py \
             --pool $POOL \
             --start $START \
             --end $END \
-            --incremental \
             --no-plot
 
       - name: 📤 上传更新后的缓存
@@ -66,6 +67,7 @@ jobs:
           name: baostock-cache
           path: cache/
           retention-days: 90
+          if-no-files-found: ignore
 
       - name: 📊 推送飞书
         if: env.FEISHU_WEBHOOK != ''

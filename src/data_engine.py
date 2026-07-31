@@ -227,8 +227,8 @@ def get_stock_pool(pool_name: str = "hs300") -> List[str]:
         rs = bs.query_hs300_stocks()
     elif pool_name == "zz500":
         rs = bs.query_zz500_stocks()
-    elif pool_name in ("top1500", "all_filtered"):
-        # 获取全A股，然后按市值过滤
+    elif pool_name in ("all", "all_filtered", "top1500", "top20"):
+        # 全A股（含沪/深/创业板/科创板/北交所）
         rs = bs.query_all_stock(day=datetime.date.today().strftime("%Y-%m-%d"))
     else:
         raise ValueError(f"Unknown pool: {pool_name}")
@@ -236,13 +236,23 @@ def get_stock_pool(pool_name: str = "hs300") -> List[str]:
     codes = []
     while rs.next():
         row = rs.get_row_data()
-        if row[0]:  # 代码
-            ts_code = _to_ts_code(row[0])
-            codes.append(ts_code)
+        if not row or not row[0]:  # 代码
+            continue
+        code = row[0]
+        # all_filtered：剔除名称含 ST / 退 的股票
+        if pool_name == "all_filtered" and len(row) > 2:
+            name = row[2] if row[2] else ""
+            if "ST" in name.upper() or "退" in name:
+                continue
+        ts_code = _to_ts_code(code)
+        codes.append(ts_code)
 
     if pool_name == "top1500":
-        # 需要市值排序，这里简化处理：取前1500
+        # 简化处理：取前1500（未真正按市值排序，市值排序需额外接口）
         codes = codes[:1500]
+    elif pool_name == "top20":
+        # 调试用：前20只
+        codes = codes[:20]
 
     # 缓存股票池
     pd.DataFrame({'code': codes}).to_csv(pool_cache_file, index=False)

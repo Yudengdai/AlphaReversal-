@@ -5,8 +5,9 @@
 feishu_notify.py — AlphaReversal 飞书推送
 ================================================================
 功能：
-  读取 results/signals.csv 和 results/positions.csv
-  组装成飞书 interactive 卡片并推送
+  读取 output/ 目录下真实回测结果（trades.csv / daily_equity.csv）
+  派生当日信号与持仓，计算绩效指标，组装飞书卡片推送
+  （兼容旧版手写 results/signals.csv / results/positions.csv）
 
 用法：
   python feishu_notify.py           # 推送卡片（默认）
@@ -20,9 +21,11 @@ import os
 import sys
 import argparse
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import requests
+import pandas as pd
+import numpy as np
 
 # ─────────────────────────────────────────────
 # 配置
@@ -280,74 +283,176 @@ def build_text(
 
 
 # ─────────────────────────────────────────────
-# 数据读取
+# 数据读取（真实回测结果 output/ 目录）
 # ─────────────────────────────────────────────
-def load_signals() -> List[Dict]:
-    """
-    从 results/signals.csv 读取信号
-    格式：code,price,qty
-    """
-    path = "results/signals.csv"
-    if not os.path.exists(path):
-        print(f"  ℹ️ {path} 不存在，返回空列表")
-        return []
-    signals = []
-    with open(path, "r", encoding="utf-8") as f:
-        header = f.readline()  # 跳过标题行
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(",")
-            if len(parts) >= 3:
-                signals.append({
-                    "code":   parts[0].strip(),
-                    "price":  parts[1].strip(),
-                    "qty":    parts[2].strip(),
-                })
-    print(f"  📄 读取 {len(signals)} 条信号")
-    return signals
+def _find_csv(name: str) -> Optional[str]:
+    """按优先级查找文件：output/ → results/ → results/YYYYMMDD/ 最新"""
+    for base in ["output", "results"]:
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            return p
+    # 在 results 子目录中找最新的
+    if os.path.isdir("results"):
+        subdirs = sorted(
+            [d for d in os.listdir("results") if os.path.isdir(os.path.join("results", d))],
+            reverse=True
+        )
+        for d in subdirs:
+            p = os.path.join("results", d, name)
+            if os.path.exists(p):
+                return p
+    return None
 
 
-def load_positions() -> List[Dict]:
+def load_trades() -> Optional[pd.DataFrame]:
+    """读取最新回测交易记录 output/trades.csv"""
+    path = _find_csv("trades.csv")
+    if not path:
+        print(f"  ℹ️ trades.csv 不存在（output/ 或 results/），返回空")
+        return None
+    df = pd.read_csv(path)
+    print(f"  📄 读取交易记录: {path} ({len(df)} 笔)")
+    return df
+
+
+def load_daily() -> Optional[pd.DataFrame]:
+    """读取每日净值 output/daily_equity.csv"""
+    path = _find_csv("daily_equity.csv")
+    if not path:
+        print(f"  ℹ️ daily_equity.csv 不存在，返回空")
+        return None
+    df = pd.read_csv(path)
+    df["date"] = pd.to_datetime(df["date"])
+    print(f"  📄 读取净值曲线: {path} ({len(df)} 行, {df['date'].min().date()} ~ {df['date'].max().date()})")
+    return df
+
+
+def load_signals(trades: Optional[pd.DataFrame] = None) -> List[Dict]:
     """
-    从 results/positions.csv 读取持仓
-    格式：code,buy_price,buy_date
+    获取信号列表：
+    1. 优先读手写维护的 results/signals.csv（兼容旧用法）
+    2. 否则从最新回测 trades.csv 提取最近 5 笔买入作为信号
     """
-    path = "results/positions.csv"
-    if not os.path.exists(path):
-        print(f"  ℹ️ {path} 不存在，返回空列表")
-        return []
-    positions = []
-    with open(path, "r", encoding="utf-8") as f:
-        header = f.readline()
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(",")
-            if len(parts) >= 3:
+    legacy = "results/signals.csv"
+    if os.path.exists(legacy):
+        signals = []
+        with open(legacy, "r", encoding="utf-8") as f:
+            f.readline()  # 跳过标题
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    signals.append({
+                        "code":  parts[0].strip(),
+                        "price": parts[1].strip(),
+                        "qty":   parts[2].strip(),
+                    })
+        print(f"  📄 读取 {len(signals)} 条信号（results/signals.csv）")
+        return signals
+
+    # 从 trades.csv 派生最近买入
+    if trades is not None and not trades.empty:
+        df = trades.sort_values("buy_date", ascending=False).head(5)
+        signals = []
+        for _, row in df.iterrows():
+            pnl_pct = row.get("pnl_pct", 0)
+            signals.append({
+                "code":  row["code"],
+                "price": f"{row['buy_price']:.2f}",
+                "qty":   str(int(row.get("shares", 0))),
+                "pnl_pct": f"{pnl_pct:+.2f}%",
+            })
+        print(f"  📄 从 trades.csv 派生 {len(signals)} 条最近买入")
+        return signals
+
+    print(f"  ℹ️ 无信号数据")
+    return []
+
+
+def load_positions(trades: Optional[pd.DataFrame] = None) -> List[Dict]:
+    """
+    获取持仓列表：
+    1. 优先读手写维护的 results/positions.csv
+    2. 否则从 trades.csv 找未平仓（sell_date 为空/NaN）记录
+    """
+    legacy = "results/positions.csv"
+    if os.path.exists(legacy):
+        positions = []
+        with open(legacy, "r", encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    positions.append({
+                        "code":      parts[0].strip(),
+                        "buy_price": parts[1].strip(),
+                        "buy_date":  parts[2].strip(),
+                    })
+        print(f"  📄 读取 {len(positions)} 条持仓（results/positions.csv）")
+        return positions
+
+    # 从 trades.csv 找未平仓持仓
+    if trades is not None and not trades.empty:
+        open_df = trades[trades["sell_date"].isna() | (trades["sell_date"].astype(str).str.strip() == "")]
+        if not open_df.empty:
+            positions = []
+            for _, row in open_df.iterrows():
                 positions.append({
-                    "code":       parts[0].strip(),
-                    "buy_price":  parts[1].strip(),
-                    "buy_date":   parts[2].strip(),
+                    "code":      row["code"],
+                    "buy_price": f"{row['buy_price']:.2f}",
+                    "buy_date":  str(row["buy_date"]),
                 })
-    print(f"  📄 读取 {len(positions)} 条持仓")
-    return positions
+            print(f"  📄 从 trades.csv 提取 {len(positions)} 只未平仓持仓")
+            return positions
+
+    print(f"  ℹ️ 无持仓数据（全部已平仓）")
+    return []
 
 
-def load_metrics() -> Dict:
+def load_metrics(trades: Optional[pd.DataFrame] = None,
+                 daily: Optional[pd.DataFrame] = None) -> Dict:
     """
-    读取绩效指标
-    当前为硬编码示例，后续可接入 signal_tracker.py 实时计算
+    从真实回测结果计算绩效指标：
+    - 交易笔数 / 胜率 / 总盈亏 ← trades.csv
+    - 当前回撤 ← daily_equity.csv 最后一行 drawdown
+    - 近30日区间收益 ← daily_equity.csv 最近30日 equity 变化
     """
-    return {
-        "trade_count":     8,
-        "win_rate":        62,
-        "profit":          "+3420",
-        "drawdown":        "-2.1%",
-        "interval_return": "+1.8%",
+    metrics = {
+        "trade_count":     "?",
+        "win_rate":        "?",
+        "profit":          "?",
+        "drawdown":        "?",
+        "interval_return": "?",
     }
+
+    if trades is not None and not trades.empty:
+        metrics["trade_count"] = len(trades)
+        if "pnl" in trades.columns:
+            total_pnl = trades["pnl"].sum()
+            metrics["profit"] = f"{total_pnl:+,.0f}"
+        if "pnl" in trades.columns and len(trades) > 0:
+            win_rate = (trades["pnl"] > 0).mean() * 100
+            metrics["win_rate"] = f"{win_rate:.0f}"
+
+    if daily is not None and not daily.empty:
+        # 当前回撤（最后一行，小数转百分比）
+        last_dd = daily.iloc[-1].get("drawdown", 0)
+        if pd.notna(last_dd):
+            metrics["drawdown"] = f"{float(last_dd) * 100:.2f}%"
+        # 近30日区间收益
+        recent = daily.tail(30)
+        if len(recent) >= 2 and "equity" in recent.columns:
+            ret = recent["equity"].iloc[-1] / recent["equity"].iloc[0] - 1
+            metrics["interval_return"] = f"{ret * 100:+.2f}%"
+
+    print(f"  📄 绩效: {metrics['trade_count']}笔 | 胜率{metrics['win_rate']}% | "
+          f"盈亏{metrics['profit']} | 回撤{metrics['drawdown']}")
+    return metrics
 
 
 # ─────────────────────────────────────────────
@@ -368,14 +473,18 @@ def main():
         sys.exit(1)
 
     # 读取数据
-    print("[1/4] 加载信号...")
-    signals = load_signals()
+    print("[1/4] 加载回测结果...")
+    trades = load_trades()
+    daily = load_daily()
 
-    print("[2/4] 加载持仓...")
-    positions = load_positions()
+    print("[2/4] 加载信号...")
+    signals = load_signals(trades)
 
-    print("[3/4] 加载绩效指标...")
-    metrics = load_metrics()
+    print("[3/4] 加载持仓...")
+    positions = load_positions(trades)
+
+    print("[3.5/4] 计算绩效指标...")
+    metrics = load_metrics(trades, daily)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     print(f"   日期: {date_str}")

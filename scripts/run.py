@@ -316,7 +316,6 @@ def main():
     # ============================================================
     # 完成
     # ============================================================
-    total_time = time.time() - start_time if 'start_time' in dir() else 0
     print("\n" + "=" * 65)
     print(f" 回测完成！查看 output/ 目录下的结果文件")
     print(f" 总耗时: {time.time() - t0_global:.0f}s")
