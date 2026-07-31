@@ -1,23 +1,18 @@
 name: AlphaReversal Daily Signal
 
 "on":
-  # 北京时间 16:30（A股收盘后） = UTC 08:30，工作日
   schedule:
-    - cron: '30 8 * * 1-5'
-  workflow_dispatch:  # 允许手动触发
+    - cron: '30 8 * * 1-5'   # 工作日 16:30 北京时间 = UTC 08:30
+  workflow_dispatch:
 
 env:
   FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
 
 jobs:
-  # ─────────────────────────────────────
-  # Job 1: 每日信号生成 + 飞书推送
-  # ─────────────────────────────────────
   daily-signal:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -42,50 +37,63 @@ jobs:
             echo "✅ 已生成 config.py"
           fi
 
-      - name: 🚀 运行策略（有 Token 真实运行，无 Token 模拟数据）
+      # ── 关键：下载历史缓存（如有）──
+      - name: 📦 下载 baostock 缓存
+        uses: actions/download-artifact@v4
+        with:
+          name: baostock-cache
+          path: cache/
+        continue-on-error: true
+
+      - name: 📊 缓存状态
         run: |
-          if [ -z "$TUSHARE_TOKEN" ]; then
-            echo "⚠️ TUSHARE_TOKEN 未设置，使用示例数据模拟"
-            mkdir -p results
-
-            echo "code,price,qty" > results/signals.csv
-            echo "600519.SH,1680.50,5" >> results/signals.csv
-            echo "300750.SZ,245.30,40" >> results/signals.csv
-            echo "002594.SZ,89.20,110" >> results/signals.csv
-
-            echo "code,buy_price,buy_date" > results/positions.csv
-            echo "600036.SH,38.50,2026-07-28" >> results/positions.csv
-            echo "000858.SZ,142.80,2026-07-21" >> results/positions.csv
-
-            echo "✅ 示例数据已生成"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  缓存目录状态"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          if [ -d cache/stocks ]; then
+            echo "📂 股票缓存: $(ls cache/stocks/ 2>/dev/null | wc -l) 只"
           else
-            echo "🚀 TUSHARE_TOKEN 已设置，开始真实回测"
-            START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
-            END=$(TZ='Asia/Shanghai' date +%Y%m%d)
-            echo "📅 数据区间: $START ~ $END"
-            python run.py \
-              --pool top1500 \
-              --start $START \
-              --end $END \
-              --no-plot \
-              --execution next_open
+            echo "📂 股票缓存: 空（首次运行将全量下载）"
+            mkdir -p cache/stocks cache/index cache/pool cache/funda
+          fi
+          if [ -d cache/index ]; then
+            echo "📂 指数缓存: $(ls cache/index/ 2>/dev/null | wc -l) 个"
           fi
 
-      - name: 📊 推送飞书
+      - name: 🚀 运行当日策略（增量模式）
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  AlphaReversal 每日回测（增量缓存版）"
+          echo "  时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # 数据区间：70 天前 ~ 今天
+          START=$(TZ='Asia/Shanghai' date -d '70 days ago' +%Y%m%d)
+          END=$(TZ='Asia/Shanghai' date +%Y%m%d)
+
+          echo "📅 数据区间: $START ~ $END"
+          echo "🔄 增量模式：只拉取缓存缺失的日期"
+          echo ""
+
+          python scripts/run.py \
+            --pool hs300 \
+            --start $START \
+            --end $END \
+            --no-plot \
+            --execution next_open
+
+      - name: 📊 推送飞书（完整卡片）
         if: env.FEISHU_WEBHOOK != ''
         run: |
           echo "📤 推送飞书..."
-          python feishu_notify.py
+          python feishu_notify.py --mode full --no-image
 
-      - name: 📤 上传结果存档
-        if: always()
+      - name: 📤 上传更新后的缓存
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ github.run_id }}
-          path: |
-            output/
-            results/
-          retention-days: 30
+          name: baostock-cache
+          path: cache/
+          retention-days: 90
 
       - name: 📋 打印摘要
         if: always()
@@ -93,5 +101,12 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  运行结束"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          ls -la results/ 2>/dev/null || echo "results/ 不存在"
-          ls -la output/ 2>/dev/null || echo "output/ 不存在"
+          echo "📂 缓存统计:"
+          echo "  股票: $(ls cache/stocks/ 2>/dev/null | wc -l) 只"
+          echo "  指数: $(ls cache/index/ 2>/dev/null | wc -l) 个"
+          echo "  股票池快照: $(ls cache/pool/ 2>/dev/null | wc -l) 个"
+          if [ -f output/trades.csv ]; then
+            echo ""
+            echo "📄 最近交易记录:"
+            tail -5 output/trades.csv
+          fi
