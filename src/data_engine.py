@@ -216,9 +216,39 @@ def _to_bs_code(ts_code: str) -> str:
     return bs_code
 
 def _to_ts_code(bs_code: str) -> str:
-    """'sz.000001' → '000001.SZ'"""
-    exchange, code = bs_code.split('.')
-    return f"{code}.{exchange.upper()}"
+    """将 baostock 代码转为 tushare 格式（如 600519 -> 600519.SH）"""
+    if '.' in bs_code:
+        # 格式如 sh.600519 或 600519.SH
+        parts = bs_code.split('.')
+        code = parts[-1]  # 取数字部分
+        exchange = parts[0].upper()
+        if exchange in ('SH', 'SZ'):
+            return f"{code}.{exchange}"
+        elif exchange == 'SH':
+            return f"{code}.SH"
+        elif exchange == 'SZ':
+            return f"{code}.SZ"
+        else:
+            # 未知交易所，根据代码前缀判断
+            if code.startswith(('6', '9')):
+                return f"{code}.SH"
+            elif code.startswith(('0', '2', '3')):
+                return f"{code}.SZ"
+            elif code.startswith(('4', '8')):
+                return f"{code}.BJ"
+            else:
+                return f"{code}.SH"
+    else:
+        # 纯数字格式，根据前缀判断交易所
+        code = bs_code.strip()
+        if code.startswith(('6', '9')):
+            return f"{code}.SH"
+        elif code.startswith(('0', '2', '3')):
+            return f"{code}.SZ"
+        elif code.startswith(('4', '8')):
+            return f"{code}.BJ"
+        else:
+            return f"{code}.SH"
 
 def _exchange_prefix(ts_code: str) -> str:
     """返回缓存子目录名: sh/sz/bj"""
